@@ -1,0 +1,12 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+langchain>=0.3.4
+langchain-openai>=0.2.2
+python-dotenv>=1.0.1
+# 主对话链路直接 import openai（原生 SDK 保留 reasoning_content 厂商扩展），显式声明
+openai>=1.40.0
+# 阶段1：只读工具调用循环（StateGraph + custom stream writer）
+langgraph>=1.2.11
+
+# 测试（tests/）
+pytest>=8.0.0

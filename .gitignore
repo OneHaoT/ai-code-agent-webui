@@ -1,0 +1,46 @@
+# ========== 密钥与本地环境配置（.env.example 仍纳入版本库） ==========
+.env
+*.env.local
+
+# ========== Trae/IDE 工作文档与本地私密配置（含内网地址等，不入库） ==========
+/.trae/
+/web/config/
+
+# ========== 运行时数据：本地图片存储（内容寻址，非源码） ==========
+/image/
+
+# ========== 日志 ==========
+*.log
+logs/
+
+# ========== Java / Maven（web/） ==========
+target/
+*.class
+*.jar
+!**/maven-wrapper.jar
+.idea/
+*.iml
+
+# ========== Node / Vite（ui/） ==========
+node_modules/
+dist/
+dist-ssr/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ========== Python（ai/） ==========
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ========== 操作系统/编辑器杂项 ==========
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/*
+!.vscode/settings.json

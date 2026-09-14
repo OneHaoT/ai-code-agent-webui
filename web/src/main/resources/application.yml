@@ -1,0 +1,57 @@
+server:
+  port: 8080
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: ai-assist-web
+  # 数据库类型按 profile 切换：当前 mysql；未来可新增 application-postgresql.yml
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:mysql}
+  servlet:
+    multipart:
+      max-file-size: 10MB      # 单张图片上限
+      max-request-size: 42MB   # 一次请求最多 4 张（与前端/后端图片数限制一致）
+  flyway:
+    enabled: true
+    # 迁移脚本按数据库方言分目录；具体 locations 在 application-mysql.yml 中指定
+
+mybatis-plus:
+  configuration:
+    # 列名映射：created_at -> createdAt（数据库列均为 snake_case）
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+
+# AI 模块（FastAPI 服务）连接配置
+ai:
+  service:
+    url: http://127.0.0.1:8001
+    connect-timeout: 5s    # 建立 TCP 连接超时
+    read-timeout: 180s     # 读取大模型响应超时（含图片理解，生成可能较慢）
+    # 仅最近 N 条历史消息携带图片 data URL；更早的只传图片数量（AI 折叠摘要用）。
+    # 必须 >= AI 模块 MEMORY_WINDOW_SIZE（ai/.env，默认 10），否则窗口内图片会丢失
+    history-image-window: 10
+
+# 图片存储配置
+app:
+  storage:
+    # local=本地磁盘（当前实现）；未来接入阿里云 OSS/MinIO 时新增 OssStorageService 并改为 oss
+    type: local
+    local:
+      # 相对 web 工作目录（web/），即项目根目录下的 image/
+      dir: ../image
+      # 图片最长边像素兜底上限（前端上传前已压缩到 2048，此处防绕过前端直传超大图）
+      max-dimension: 4096
+    # 孤儿图片定时 GC（兜底即时回滚覆盖不到的异常路径）
+    cleanup:
+      cron: "0 0 * * * *"   # 每小时整点
+      grace-minutes: 60     # 无引用且落盘超过 60 分钟才清理（保护进行中的请求）
+
+logging:
+  level:
+    com.aiassist: INFO
+    org.springframework.web: INFO

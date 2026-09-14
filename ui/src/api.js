@@ -1,0 +1,191 @@
+// 与后端通信的 API 封装
+const BASE = '' // 走 vite 代理 /api -> http://localhost:8080
+
+async function request(path, options = {}) {
+  const res = await fetch(BASE + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options
+  })
+  if (!res.ok) {
+    let msg = `请求失败 (${res.status})`
+    try {
+      const data = await res.json()
+      if (data.error) msg = data.error
+    } catch (_) {}
+    throw new Error(msg)
+  }
+  return res.json()
+}
+
+export const api = {
+  listConversations: () => request('/api/conversations'),
+  createConversation: (title) =>
+    request('/api/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ title: title || null })
+    }),
+  deleteConversation: (id) =>
+    request(`/api/conversations/${id}`, { method: 'DELETE' }),
+  getConversation: (id) => request(`/api/conversations/${id}`),
+  renameConversation: (id, title) =>
+    request(`/api/conversations/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title })
+    }),
+
+  /**
+   * 上传图片（multipart 不能带 JSON Content-Type，浏览器自动设置 boundary）
+   * @returns {Promise<{id:string,filename:string,contentType:string,size:number,url:string}>}
+   */
+  uploadImage: async (file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await fetch(BASE + '/api/images/upload', { method: 'POST', body: fd })
+    if (!res.ok) {
+      let msg = `图片上传失败 (${res.status})`
+      try {
+        const data = await res.json()
+        if (data.error) msg = data.error
+      } catch (_) {}
+      throw new Error(msg)
+    }
+    return res.json()
+  },
+
+  /**
+   * 删除已上传图片（幂等）。多图上传部分失败时用于回滚已成功的图片，
+   * 避免服务端留下无引用的孤儿文件。
+   */
+  deleteImage: (id) => request(`/api/images/${id}`, { method: 'DELETE' }),
+
+  /**
+   * 流式发送消息（SSE）。handlers 回调：
+   *   onMeta({model}) / onToken(delta) / onReasoning(delta) /
+   *   onToolCall({id,name,args,rawArgs}) / onToolResult({id,name,status,output,truncated}) /
+   *   onDone({message})
+   * 响应头提交前的失败（400/502 等）以普通 reject(Error) 抛出；
+   * 流开始后的失败以 onError({message}) 事件返回（服务端会回滚用户消息）。
+   * signal 用于"停止生成"：abort 后本函数静默返回（不触发 onError），
+   * 由调用方决定本地 UI 收尾；服务端仍会把请求跑完并落库。
+   */
+  sendMessageStream: async (id, message, images = [], thinking = false, handlers = {}, signal) => {
+    const res = await fetch(BASE + `/api/conversations/${id}/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify({
+        message: message || '',
+        images: images.map((im) => ({
+          id: im.id,
+          filename: im.filename,
+          contentType: im.contentType
+        })),
+        thinking: !!thinking
+      }),
+      signal
+    })
+
+    // HTTP 状态异常：响应头尚未进入 SSE，按普通 JSON 错误处理
+    if (!res.ok || !res.body) {
+      let msg = `流式请求失败 (${res.status})`
+      try {
+        const data = await res.json()
+        msg = data.error || data.message || msg
+      } catch (_) {}
+      throw new Error(msg)
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    // 是否已收到终结帧（done/error）。连接被代理掐断或后端异常退出时，
+    // reader 可能在没有任何终结帧的情况下关闭，必须按失败处理，
+    // 否则界面会永久停留在“生成中”（光标闪烁、消息未落库）
+    let terminalReceived = false
+
+    const dispatchFrame = (rawFrame) => {
+      let event = 'message'
+      const dataLines = []
+      rawFrame.split(/\r?\n/).forEach((line) => {
+        if (!line || line.startsWith(':')) return
+        const idx = line.indexOf(':')
+        const field = idx === -1 ? line : line.slice(0, idx)
+        let value = idx === -1 ? '' : line.slice(idx + 1)
+        if (value.startsWith(' ')) value = value.slice(1)
+        if (field === 'event') event = value
+        else if (field === 'data') dataLines.push(value)
+      })
+      if (dataLines.length === 0) return
+      let payload
+      try {
+        payload = JSON.parse(dataLines.join('\n'))
+      } catch (_) {
+        return // 坏帧忽略
+      }
+      switch (event) {
+        case 'meta':
+          handlers.onMeta?.(payload)
+          break
+        case 'token':
+          handlers.onToken?.(payload.delta || '')
+          break
+        case 'reasoning':
+          handlers.onReasoning?.(payload.delta || '')
+          break
+        case 'tool_call':
+          // args 可能为 null（参数 JSON 非法时随 raw_args 原样下发）
+          handlers.onToolCall?.({
+            id: payload.id,
+            name: payload.name,
+            args: payload.args ?? null,
+            rawArgs: payload.raw_args ?? null
+          })
+          break
+        case 'tool_result':
+          handlers.onToolResult?.({
+            id: payload.id,
+            name: payload.name,
+            status: payload.status || 'error',
+            output: payload.output ?? '',
+            truncated: !!payload.truncated
+          })
+          break
+        case 'done':
+          terminalReceived = true
+          handlers.onDone?.(payload)
+          break
+        case 'error':
+          terminalReceived = true
+          handlers.onError?.(payload)
+          break
+      }
+    }
+
+    while (true) {
+      let chunk
+      try {
+        chunk = await reader.read()
+      } catch (readErr) {
+        // 用户主动停止：静默退出，不触发"连接中断"错误
+        if (readErr.name === 'AbortError') return
+        throw readErr
+      }
+      const { done, value } = chunk
+      if (done) break
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+      let sep
+      // SSE 帧以空行分隔
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const rawFrame = buffer.slice(0, sep)
+        buffer = buffer.slice(sep + 2)
+        dispatchFrame(rawFrame)
+      }
+    }
+    if (buffer.trim()) dispatchFrame(buffer)
+
+    if (!terminalReceived) {
+      handlers.onError?.({ message: '连接中断，未收到完整响应，请重试' })
+    }
+  },
+
+  aiStatus: () => request('/api/ai/status')
+}
