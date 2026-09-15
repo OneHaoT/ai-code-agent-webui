@@ -508,7 +508,8 @@ def test_execute_tool_hard_timeout(ws, monkeypatch):
 
 def test_tool_schemas_complete():
     names = {t["function"]["name"] for t in tools.TOOL_SCHEMAS}
-    assert names == {"read_file", "list_dir", "glob", "grep"}
+    # 阶段2：RAG_ENABLED 默认 true，search_code 自动装配进工具集
+    assert names == {"read_file", "list_dir", "glob", "grep", "search_code"}
     required_map = {
         spec["function"]["name"]:
             spec["function"]["parameters"].get("required", [])
@@ -519,6 +520,7 @@ def test_tool_schemas_complete():
     assert required_map["list_dir"] == []
     assert required_map["glob"] == ["pattern"]
     assert required_map["grep"] == ["pattern"]
+    assert required_map["search_code"] == ["query"]
 
 
 # ---------------- read_file：PDF 文档分支（阶段2） ----------------

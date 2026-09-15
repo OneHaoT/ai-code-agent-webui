@@ -18,6 +18,7 @@ TOOL_GLOB_LIMIT=200  TOOL_GREP_LIMIT=100    TOOL_TIMEOUT_SECONDS=10
 from __future__ import annotations
 
 import fnmatch
+import heapq
 import os
 import re
 import stat
@@ -58,6 +59,12 @@ GREP_LINE_CHARS = 1_000           # 单条匹配行展示上限
 GREP_MAX_LINE_BYTES = 1024 * 1024  # 单行最大匹配字节（防单行 GB 级文件撑爆内存/正则输入）
 MAX_OFFSET_LINES = 2_000_000       # read_file offset 硬上限（防巨大 offset 全文空扫）
 COUNT_LINES_MAX_BYTES = 5 * 1024 * 1024  # 截断时只对此大小内文件数总行数
+
+# ---- 阶段2：语义检索（RAG） ----
+# 与 main.py / indexer.py 读同一 env；false 时工具集不含 search_code（四件套不变）
+RAG_ENABLED = os.getenv("RAG_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 # Windows/macOS 文件系统大小写不敏感：忽略目录名匹配需同步小写化
 _IGNORE_NAME_CASE = sys.platform in ("win32", "darwin")
 
@@ -306,39 +313,49 @@ def _format_lines_output(*, name: str, ws: Workspace, target: Path,
 
 # ---------------- list_dir ----------------
 
+def _listdir_entries(target: Path):
+    """流式产出目录直接子项 ``(group, lower_name, path, kind, size)``。
+
+    group：0=目录 1=文件/链接（与排序契约一致：目录在前、组内按名称排序）。
+    一次 lstat 只取条目自身元数据：符号链接（无论指向根内/根外、文件/目录）
+    统一只展示 "[链接]" 与名称——不 resolve、不跟随后缀斜杠、不泄露目标
+    类型/大小/存在性等沙箱外元数据。
+    """
+    for p in target.iterdir():
+        try:
+            st = p.lstat()
+        except OSError:
+            yield (1, p.name.lower(), p, "file", None)
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            yield (1, p.name.lower(), p, "link", None)
+        elif stat.S_ISDIR(st.st_mode):
+            yield (0, p.name.lower(), p, "dir", None)
+        else:
+            yield (1, p.name.lower(), p, "file", st.st_size)
+
+
 def list_dir(ws: Workspace, path: str = ".") -> ToolOutput:
     name = "list_dir"
     target, err = _resolve_target(ws, path, name, expect="dir")
     if err is not None:
         return err
     try:
-        # 一次 lstat 取条目自身元数据：符号链接（无论指向根内/根外、文件/目录）
-        # 统一只展示 "[链接]" 与名称——不 resolve、不跟随后缀斜杠、不泄露目标
-        # 类型/大小/存在性等沙箱外元数据
-        items = []
-        for p in target.iterdir():
-            try:
-                st = p.lstat()
-            except OSError:
-                items.append((p, "file", None))
-                continue
-            if stat.S_ISLNK(st.st_mode):
-                items.append((p, "link", None))
-            elif stat.S_ISDIR(st.st_mode):
-                items.append((p, "dir", None))
-            else:
-                items.append((p, "file", st.st_size))
+        # 计数 O(1) 内存；展示只保留排序后前 LIST_LIMIT 项。
+        # heapq.nsmallest 等价 sorted(iterable, key=key)[:k]，时间 O(n log k)、
+        # 内存 O(k)——百万条目目录不再全量物化（阶段1 遗留 N1 修复），
+        # 输出与全量排序后截断逐字节一致（sorted 稳定，同名大小写并列次序不变）。
+        total = sum(1 for _ in target.iterdir())
+        top = heapq.nsmallest(
+            LIST_LIMIT, _listdir_entries(target), key=lambda t: (t[0], t[1]))
     except OSError as e:
         return _error(name, f"列出目录失败：{e}")
 
-    # 目录在前、文件/链接在后；组内按名称不区分大小写排序
-    items.sort(key=lambda t: (0 if t[1] == "dir" else 1, t[0].name.lower()))
-    total = len(items)
     truncated = total > LIST_LIMIT
 
     tag_map = {"dir": "[目录]", "file": "[文件]", "link": "[链接]"}
     lines = [f"[目录] {ws.relative(target) or '.'}/"]
-    for p, kind, size in items[:LIST_LIMIT]:
+    for _group, _key, p, kind, size in top:
         tag = tag_map[kind]
         suffix = "/" if kind == "dir" else ""
         size_text = f" ({_human_size(size)})" if size is not None else ""
@@ -609,6 +626,92 @@ def grep(ws: Workspace, pattern: str, path: str = ".",
                       truncated=truncated)
 
 
+# ---------------- search_code（阶段2：语义检索） ----------------
+
+_SEARCH_PREVIEW_LINES = 20     # 每条命中预览行数上限
+_SEARCH_PREVIEW_CHARS = 200    # 预览单行字符上限
+
+
+def search_code(ws: Workspace, query: str, path: str = ".") -> ToolOutput:
+    """语义检索：查询向量 vs 索引快照余弦相似度，返回 top-k 命中片段。
+
+    只读语义与四件套一致：查的是索引快照与既有文件预览，零写入。
+    索引刷新由 indexer 后台线程执行（绝不占工具超时池做重活）：
+    ensure_ready 最多同步等 RAG_BUILD_WAIT_SECONDS，等不到返回"构建中"
+    （success 状态，由模型决定稍后重试或直接作答，不杀流）。
+    """
+    name = "search_code"
+    if not isinstance(query, str) or not query.strip():
+        return _error(name, "参数 query 必须是非空字符串")
+    target, err = _resolve_target(ws, path, name)  # 允许目录或单个文件
+    if err is not None:
+        return err
+
+    # 延迟导入：RAG_ENABLED=false 时 tools 模块保持零 RAG 依赖
+    from embedding import EmbeddingError
+    from indexer import get_workspace_index
+
+    idx = get_workspace_index(ws)
+    try:
+        status = idx.ensure_ready()  # 冷启动时模型下载/加载在后台线程进行
+    except Exception as e:  # noqa: BLE001 —— 防御：任何索引异常都不杀流
+        return _error(name, f"索引不可用：{e}")
+    if status == "error":
+        return _error(name, idx.last_error or "索引构建失败")
+    if status == "building":
+        return ToolOutput(
+            name=name, status="success", truncated=False, output=(
+                f"[search_code] {query.strip()} @ {ws.relative(target) or '.'}/\n"
+                "索引正在后台构建（首次检索需遍历并编码工作区文件），本轮暂无结果。\n"
+                "请稍后重新调用本工具，或先用 glob/grep 定位。"))
+
+    try:
+        qvec = idx.provider.embed_query(query)
+    except EmbeddingError as e:
+        return _error(name, str(e))
+
+    rel = ws.relative(target)
+    # 根目录的 relative 返回 "."，归一化为空前缀（否则过滤掉全部命中）
+    prefix = "" if rel in ("", ".") else rel.replace("\\", "/").strip("/")
+    hits = idx.search(qvec, path_prefix=prefix)
+    snap = idx.snapshot
+
+    head = f"[search_code] {query.strip()} @ {prefix + '/' if prefix else './'}"
+    if not hits:
+        output = (head + "\n无命中。可尝试换更具体的表述（如涉及的关键类型/函数名），"
+                  "或改用 grep 做精确文本匹配。")
+        return ToolOutput(name=name, status="success", truncated=False, output=output)
+
+    lines = [head, f"共 {len(hits)} 个命中（相关度降序）：", ""]
+    for rank, hit in enumerate(hits, start=1):
+        c = hit.chunk
+        lines.append(f"{rank}. {c.rel_path} L{c.line_start}-{c.line_end}"
+                     f" 相关度 {hit.score:.2f}")
+        body = c.text.splitlines()[1:]  # 首行是【文件: …】头，预览跳过
+        for offset, src_line in enumerate(body[:_SEARCH_PREVIEW_LINES]):
+            text = src_line[:_SEARCH_PREVIEW_CHARS]
+            lines.append(f"   {c.line_start + offset}: {text}")
+        if len(body) > _SEARCH_PREVIEW_LINES:
+            lines.append(f"   …（该片段共 {len(body)} 行，仅预览前 "
+                         f"{_SEARCH_PREVIEW_LINES} 行，可用 read_file 续读）")
+        lines.append("")
+    notes = []
+    if snap is not None and snap.capped:
+        notes.append("索引不完整（工作区超过 chunk 上限，仅部分文件入索引）")
+    if notes:
+        lines.append("；".join(notes))
+    output = "\n".join(lines).rstrip() + "\n"
+
+    truncated = False
+    raw = output.encode("utf-8")
+    if len(raw) > MAX_BYTES:
+        output = raw[:MAX_BYTES].decode("utf-8", errors="ignore") \
+            + "\n…（输出超限截断）"
+        truncated = True
+    return ToolOutput(name=name, status="success", truncated=truncated,
+                      output=output)
+
+
 # ---------------- OpenAI 工具声明与分发（供 agent 使用） ----------------
 
 TOOL_SCHEMAS = [
@@ -684,12 +787,43 @@ TOOL_SCHEMAS = [
     },
 ]
 
+_BASE_TOOL_SCHEMAS = TOOL_SCHEMAS
+
+# 阶段2：语义检索工具（RAG_ENABLED=false 时整体不进工具集，四件套不受影响）
+if RAG_ENABLED:
+    TOOL_SCHEMAS = TOOL_SCHEMAS + [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_code",
+                "description": (
+                    "按语义（自然语言）检索工作区代码，返回最相关的代码片段"
+                    "（含文件路径、行号范围、相关度与内容预览）。"
+                    "适合“某某逻辑在哪实现/处理”这类模糊问题；"
+                    "精确关键词匹配请用 grep。首次调用会自动构建索引，"
+                    "索引未就绪时返回构建中提示，稍后重试即可。"),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                  "description": "自然语言查询，如“登录校验逻辑在哪”"},
+                        "path": {"type": "string",
+                                 "description": "限定检索的子目录或单个文件，默认整个工作区"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+    ]
+
 _DISPATCH = {
     "read_file": read_file,
     "list_dir": list_dir,
     "glob": glob,
     "grep": grep,
 }
+if RAG_ENABLED:
+    _DISPATCH["search_code"] = search_code
 
 
 def execute_tool(ws: Workspace, name: str, args) -> ToolOutput:

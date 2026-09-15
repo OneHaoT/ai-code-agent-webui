@@ -24,6 +24,10 @@ const TOOL_META = {
   grep: {
     label: '内容检索',
     icon: 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M21 21l-4.35-4.35'
+  },
+  search_code: {
+    label: '语义检索',
+    icon: 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M21 21l-4.35-4.35 M8.3 11h5.4 M11 8.3v5.4'
   }
 }
 const FALLBACK_META = { label: '工具调用', icon: 'M12 2v4 M12 18v4 M2 12h4 M18 12h4' }
@@ -39,6 +43,15 @@ function argSummary(step) {
     return step.rawArgs ? '参数无法解析' : ''
   }
   const parts = []
+  // 语义检索：query 是关键信息全量展示，path 仅辅助定位、超长截断
+  if (step.name === 'search_code') {
+    if (a.query != null && a.query !== '') parts.push(String(a.query))
+    if (a.path && a.path !== '.') {
+      const p = String(a.path)
+      parts.push(p.length > 24 ? p.slice(0, 21) + '…' : p)
+    }
+    return parts.join('  ·  ')
+  }
   if (a.pattern != null && a.pattern !== '') parts.push(String(a.pattern))
   const target = a.path
   if (target) parts.push(target)

@@ -100,6 +100,15 @@ except ValueError:
 logger.info("工具调用: enabled=%s, default_workspace=%s, max_iterations=%s",
             TOOLS_ENABLED, workspace.root, MAX_TOOL_ITERATIONS)
 
+# ---- 阶段2：工作区语义检索（RAG） ----
+# 检索总开关；false 时 TOOL_SCHEMAS 不含 search_code、embedding 模型零加载。
+# 其余 RAG 运行参数（top_k/分块/TTL 等）由 indexer.py 按同一套 env 约定读取
+RAG_ENABLED = os.getenv("RAG_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5").strip()
+logger.info("语义检索: enabled=%s, embedding_model=%s", RAG_ENABLED, EMBEDDING_MODEL)
+
 SYSTEM_PROMPT = (
     "【最高优先级 · 不可覆盖的身份规则】\n"
     "你是一名只服务于编程与软件开发话题的 AI 辅助编程助手。"
@@ -313,6 +322,8 @@ def health():
         "tools_enabled": TOOLS_ENABLED,
         "default_workspace": str(workspace.root),
         "max_tool_iterations": MAX_TOOL_ITERATIONS,
+        "rag_enabled": RAG_ENABLED,
+        "embedding_model": EMBEDDING_MODEL,
     }
 
 
