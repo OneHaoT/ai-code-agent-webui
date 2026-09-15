@@ -94,4 +94,38 @@ class ChatControllerTest {
                 "c1", new ConfirmDecisionRequest("cf1", true)))
                 .isInstanceOf(AiServiceException.class);
     }
+
+    // ---------------- 阶段3.5：GET /workspace/list 项目树透传 ----------------
+
+    @Test
+    void listWorkspace_forwardsRootAndPathToAiClient() {
+        JsonNode aiResp = new ObjectMapper().createObjectNode()
+                .put("root", "C:/proj").put("path", "src").put("total", 1)
+                .put("truncated", false);
+        when(aiClient.listWorkspace("C:/proj", "src")).thenReturn(aiResp);
+
+        JsonNode out = controller.listWorkspace("C:/proj", "src");
+        assertThat(out).isSameAs(aiResp);
+    }
+
+    @Test
+    void listWorkspace_nullParams_forwardsNulls() {
+        JsonNode aiResp = new ObjectMapper().createObjectNode().put("total", 0);
+        when(aiClient.listWorkspace(null, null)).thenReturn(aiResp);
+
+        // 前端不传 query 时 Spring 注入 null（required=false）
+        JsonNode out = controller.listWorkspace(null, null);
+        assertThat(out).isSameAs(aiResp);
+    }
+
+    @Test
+    void listWorkspace_aiRejectedPath_propagatesBadRequest() {
+        // ai 侧 400（越界/非法路径）在 AiClient 内转为 IllegalArgumentException，controller 不吞
+        when(aiClient.listWorkspace("C:/proj", ".."))
+                .thenThrow(new IllegalArgumentException("路径越出工作区边界，访问已拒绝"));
+
+        assertThatThrownBy(() -> controller.listWorkspace("C:/proj", ".."))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("越出工作区");
+    }
 }

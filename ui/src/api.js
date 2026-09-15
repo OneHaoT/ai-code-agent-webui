@@ -62,6 +62,19 @@ export const api = {
     request('/api/workspace/open', { method: 'POST' }),
 
   /**
+   * 只读浏览工作区单层目录（阶段3.5 项目树懒加载数据源）。
+   * root = 绑定的工作区绝对路径；path = 相对子目录（空 = 根）。
+   * 越界/非法路径后端 400，request() 抛 err（带 status）。
+   */
+  listWorkspaceFiles: (root, path) => {
+    const qs = new URLSearchParams()
+    if (root) qs.set('root', root)
+    if (path) qs.set('path', path)
+    const s = qs.toString()
+    return request(`/api/workspace/list${s ? '?' + s : ''}`)
+  },
+
+  /**
    * 转发用户对 confirm 帧的决策（阶段3 写/执行工具人机确认）。
    * confirmId 未知/已失效时后端返回 404（err.status === 404）。
    */

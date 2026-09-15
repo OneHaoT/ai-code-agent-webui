@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { api } from '../api.js'
 import { useToast } from '../composables/useToast.js'
 
@@ -163,9 +163,118 @@ function resetToDefault() {
   emit('workspaceChange', null)
 }
 
-function copyToClipboard(text) {
-  navigator.clipboard?.writeText(text)
+// ============ 项目树（阶段3.5：workspaceRoot 非空时切换为 IDE 风格文件树） ============
+// 懒加载单层目录：展开目录才请求子项；ignore 剪枝与沙箱边界由后端保证
+// （树里看到的就是 AI 能看到的）。children: null=未加载，[]=已加载空目录。
+const treeRoot = ref(null)
+
+const visibleNodes = computed(() => {
+  const out = []
+  const walk = (node, depth) => {
+    out.push({ node, depth })
+    if (node.type !== 'dir' || !node.expanded) return
+    if (node.loading) return
+    if (Array.isArray(node.children)) {
+      if (!node.children.length) {
+        out.push({ depth: depth + 1, node: { type: 'note', name: '（空目录）' } })
+        return
+      }
+      for (const c of node.children) walk(c, depth + 1)
+      if (node.truncated) {
+        out.push({
+          depth: depth + 1,
+          node: { type: 'note', name: `仅显示前 ${node.children.length} / ${node.total} 项` }
+        })
+      }
+    } else if (node.error) {
+      out.push({ depth: depth + 1, node: { type: 'note', name: node.error, isErr: true } })
+    }
+  }
+  if (treeRoot.value) walk(treeRoot.value, 0)
+  return out
+})
+
+function baseName(p) {
+  const t = (p || '').replace(/[\\/]+$/, '')
+  const i = Math.max(t.lastIndexOf('/'), t.lastIndexOf('\\'))
+  return i >= 0 ? t.slice(i + 1) : t
 }
+
+function humanSize(n) {
+  if (n == null) return ''
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+function childPath(parentPath, name) {
+  return parentPath === '.' ? name : `${parentPath}/${name}`
+}
+
+async function loadNode(node) {
+  node.loading = true
+  node.error = ''
+  try {
+    const body = await api.listWorkspaceFiles(
+      props.workspaceRoot, node.path === '.' ? '' : node.path)
+    node.children = body.entries.map((e) => ({
+      name: e.name,
+      type: e.type,
+      size: e.size ?? null,
+      path: childPath(node.path, e.name),
+      expanded: false,
+      loading: false,
+      error: '',
+      children: e.type === 'dir' ? null : undefined
+    }))
+    node.total = body.total
+    node.truncated = body.truncated
+  } catch (e) {
+    node.children = null
+    node.error = e.message || '加载失败，请刷新重试'
+  } finally {
+    node.loading = false
+  }
+}
+
+function initTree() {
+  treeRoot.value = {
+    name: baseName(props.workspaceRoot) || 'project',
+    type: 'dir',
+    path: '.',
+    expanded: true,
+    loading: false,
+    error: '',
+    children: null,
+    total: 0,
+    truncated: false
+  }
+  loadNode(treeRoot.value)
+}
+
+async function toggleNode(node) {
+  if (node.type !== 'dir') return
+  if (node.expanded) {
+    node.expanded = false
+    return
+  }
+  if (node.children === null) await loadNode(node)
+  node.expanded = true
+}
+
+function refreshTree() {
+  initTree()
+}
+
+// 绑定工作区变化（切换对话 / 重置默认 / 信任新目录）→ 树重置重载
+watch(
+  () => props.workspaceRoot,
+  (v) => {
+    if (v) initTree()
+    else treeRoot.value = null
+  },
+  { immediate: true }
+)
 </script>
 
 <template>
@@ -200,18 +309,86 @@ function copyToClipboard(text) {
       </button>
     </div>
 
-    <div class="panel-body">
-      <!-- 当前工作区状态 -->
+    <!-- 树视图：已绑定项目（IDE 风格项目管理器） -->
+    <template v-if="workspaceRoot">
+      <div class="tree-header">
+        <div class="tree-project" :title="workspaceRoot">{{ treeRoot?.name || '…' }}</div>
+        <div class="tree-actions">
+          <button class="tree-btn" title="刷新" @click="refreshTree">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button class="tree-btn" title="切回默认工作区" @click="resetToDefault">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 14 4 9 9 4"/>
+              <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+            </svg>
+          </button>
+          <button class="tree-btn" title="选择其他目录" @click="triggerSelectDirectory">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+          </button>
+          <button class="tree-btn" title="在系统中打开" @click="openInExplorer">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+              <polyline points="15 3 21 3 21 9"/>
+              <line x1="10" y1="14" x2="21" y2="3"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="tree-body">
+        <div
+          v-for="({ node, depth }) in visibleNodes"
+          :key="node.path || node.name"
+          class="tree-row"
+          :class="{ 'is-dir': node.type === 'dir', 'is-note': node.type === 'note', 'is-err': node.isErr }"
+          :style="{ paddingLeft: 8 + depth * 14 + 'px' }"
+          @click="toggleNode(node)"
+        >
+          <template v-if="node.type !== 'note'">
+            <span class="tree-caret" :class="{ open: node.expanded, ghost: node.type !== 'dir' }">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="9 18 15 12 9 6"/>
+              </svg>
+            </span>
+            <span class="tree-icon">
+              <!-- 文件夹 -->
+              <svg v-if="node.type === 'dir'" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+              <!-- 链接 -->
+              <svg v-else-if="node.type === 'link'" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+              </svg>
+              <!-- 文件 -->
+              <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+            </span>
+            <span
+              class="tree-name"
+              :title="node.type === 'file' && node.size != null ? `${node.name}（${humanSize(node.size)}）` : node.name"
+            >{{ node.name }}</span>
+            <span v-if="node.loading" class="tree-spin" />
+          </template>
+          <span v-else class="tree-note" :title="node.name">{{ node.name }}</span>
+        </div>
+      </div>
+    </template>
+
+    <!-- 默认视图：未绑定项目（保持原有信息卡 + 操作按钮） -->
+    <div v-else class="panel-body">
+      <!-- 当前工作区状态（仅默认视图：未绑定项目时 workspaceRoot 恒为 null） -->
       <div class="ws-current">
         <div class="ws-label">当前工作区</div>
-        <div v-if="workspaceRoot" class="ws-path">
-          <span class="ws-path-text" :title="workspaceRoot">{{ workspaceRoot }}</span>
-          <button class="ws-copy" title="复制路径" @click="copyToClipboard(workspaceRoot)">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-          </button>
-          <button class="ws-reset" title="切回默认工作区" @click="resetToDefault">重置</button>
-        </div>
-        <div v-else class="ws-path ws-default">
+        <div class="ws-path ws-default">
           <span class="ws-default-label">默认</span>
           <span class="ws-default-path" :title="getDefaultWs()">{{ getDefaultWs() }}</span>
           <button class="ws-open" title="在系统文件浏览器中打开" @click="openInExplorer">打开</button>
@@ -402,11 +579,7 @@ function copyToClipboard(text) {
   gap: 6px;
   line-height: 1.5;
 }
-.ws-path-text {
-  flex: 1;
-  color: var(--text);
-}
-.ws-copy, .ws-reset, .ws-open {
+.ws-open {
   flex-shrink: 0;
   border: none;
   background: transparent;
@@ -416,7 +589,7 @@ function copyToClipboard(text) {
   font-size: 11px;
   transition: all 0.12s;
 }
-.ws-copy:hover, .ws-reset:hover, .ws-open:hover {
+.ws-open:hover {
   background: rgba(0,0,0,0.06);
   color: var(--accent);
 }
@@ -616,5 +789,128 @@ function copyToClipboard(text) {
 }
 .fade-enter-from, .fade-leave-to {
   opacity: 0;
+}
+
+/* ---------- 项目树视图（阶段3.5） ---------- */
+.tree-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.tree-project {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.tree-btn {
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.tree-btn:hover {
+  background: var(--surface-2);
+  color: var(--accent);
+}
+
+.tree-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 4px;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding-right: 8px;
+  border-radius: 5px;
+  cursor: default;
+  user-select: none;
+  line-height: 1;
+}
+.tree-row.is-dir {
+  cursor: pointer;
+}
+.tree-row.is-dir:hover {
+  background: var(--surface-2);
+}
+.tree-row.is-note {
+  cursor: default;
+  height: 20px;
+}
+.tree-caret {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+.tree-caret.open {
+  transform: rotate(90deg);
+}
+.tree-caret.ghost {
+  opacity: 0;
+}
+.tree-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  color: var(--accent);
+}
+.tree-row:not(.is-dir) .tree-icon {
+  color: var(--muted);
+}
+.tree-name {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-note {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tree-row.is-err .tree-note {
+  color: #dc2626;
+}
+.tree-spin {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  margin-left: 4px;
+  border: 1.5px solid var(--accent);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: tree-rotate 0.7s linear infinite;
+}
+@keyframes tree-rotate {
+  to {
+    transform: rotate(360deg);
+  }
 }
 </style>

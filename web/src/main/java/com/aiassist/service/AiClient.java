@@ -318,4 +318,47 @@ public class AiClient {
                 })
                 .body(JsonNode.class);
     }
+
+    /**
+     * 只读浏览工作区单层目录（阶段3.5 项目树懒加载数据源）。
+     * root 为空 = AI 默认工作区；path 为相对 root 的子目录（空 = 根）。
+     * ai 侧 400（路径越界/非法工作区等请求本身非法）→ IllegalArgumentException
+     * 透传 400 并携带 ai 的 detail 信息；其余错误 → AiServiceException（502）。
+     */
+    public JsonNode listWorkspace(String root, String path) {
+        return restClient.get()
+                .uri(uriBuilder -> {
+                    var b = uriBuilder.path("/workspace/list");
+                    if (root != null && !root.isBlank()) {
+                        b.queryParam("root", root);
+                    }
+                    if (path != null && !path.isBlank()) {
+                        b.queryParam("path", path);
+                    }
+                    return b.build();
+                })
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .onStatus(status -> status.value() == 400, (req, res) -> {
+                    throw new IllegalArgumentException(aiErrorDetail(res));
+                })
+                .onStatus(HttpStatusCode::isError, (req, res) -> {
+                    throw new AiServiceException("浏览工作区失败: " + res.getStatusCode());
+                })
+                .body(JsonNode.class);
+    }
+
+    /** 读取 ai 错误响应体中的 detail 字段（FastAPI HTTPException 格式），失败退回状态码文本。 */
+    private String aiErrorDetail(org.springframework.http.client.ClientHttpResponse res) throws IOException {
+        try (InputStream in = res.getBody()) {
+            String body = new String(StreamUtils.copyToByteArray(in), StandardCharsets.UTF_8);
+            JsonNode node = new ObjectMapper().readTree(body);
+            if (node != null && node.hasNonNull("detail")) {
+                return node.get("detail").asText();
+            }
+        } catch (RestClientException | com.fasterxml.jackson.core.JsonProcessingException ignored) {
+            // 保底走状态码文本
+        }
+        return "AI 模块拒绝了该请求";
+    }
 }

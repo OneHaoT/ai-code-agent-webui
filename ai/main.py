@@ -16,7 +16,9 @@ AI 模块 - FastAPI + 原生 OpenAI SDK（DeepSeek）的智能辅助编程服务
 本模块只缓存压缩摘要（重启后可依据全量历史自动重建），可水平扩展。
 """
 import os
+import sys
 import json
+import heapq
 import logging
 import asyncio
 import uuid
@@ -32,7 +34,8 @@ from starlette.concurrency import iterate_in_threadpool
 
 from memory_manager import MemoryManager
 from agent import iter_agent_events, reject_pending_confirms, resolve_confirm
-from workspace import Workspace, PROJECT_ROOT
+from tools import _listdir_entries, LIST_LIMIT
+from workspace import DEFAULT_IGNORE_DIRS, Workspace, WorkspaceViolation, PROJECT_ROOT
 import sandbox
 
 logger = logging.getLogger("ai-assist")
@@ -405,6 +408,63 @@ def open_workspace():
     except Exception as e:
         raise HTTPException(500, f"打开目录失败：{e}")
     return {"path": path}
+
+
+@app.get("/workspace/list")
+def list_workspace_tree(root: str = "", path: str = ""):
+    """只读浏览工作区单层目录（阶段3.5 项目树懒加载数据源）。
+
+    - root 为空 = 默认工作区（与聊天请求语义一致，用模块级 workspace 实例）；
+    - path 为相对 root 的子目录，空/`.` = 根；
+    - 边界与剪枝语义与模型工具一致：Workspace 沙箱硬边界 + DEFAULT_IGNORE_DIRS
+      目录剪枝（树里看到的就是 AI 能看到的）；
+    - 排序与 kind 语义复用 tools._listdir_entries（目录在前、组内按名、
+      lstat 不跟随 symlink），单目录上限复用 LIST_LIMIT。
+    """
+    root_clean = (root or "").strip()
+    if root_clean:
+        ws = Workspace(root_clean)
+        if not ws.root.is_dir():
+            raise HTTPException(400, "工作区路径不存在或不是目录")
+    else:
+        ws = workspace
+
+    path_clean = (path or "").strip()
+    try:
+        target = ws.resolve(path_clean or ".")
+    except WorkspaceViolation:
+        raise HTTPException(400, "路径越出工作区边界，访问已拒绝")
+    if not target.exists():
+        raise HTTPException(400, f"路径不存在：{path_clean or '.'}")
+    if not target.is_dir():
+        raise HTTPException(400, f"目标不是目录：{path_clean}")
+
+    ignore_case = sys.platform in ("win32", "darwin")
+    try:
+        total = sum(1 for _ in target.iterdir())
+        top = heapq.nsmallest(
+            LIST_LIMIT, _listdir_entries(target), key=lambda t: (t[0], t[1]))
+    except OSError as e:
+        raise HTTPException(400, f"无法读取目录：{e}")
+
+    entries = []
+    for _group, _key, p, kind, size in top:
+        if kind == "dir":
+            d_key = p.name.lower() if ignore_case else p.name
+            if d_key in DEFAULT_IGNORE_DIRS:
+                continue
+        entry = {"name": p.name, "type": kind}
+        if kind == "file" and size is not None:
+            entry["size"] = size
+        entries.append(entry)
+
+    return {
+        "root": ws.root.as_posix(),
+        "path": ws.relative(target) or ".",
+        "total": total,
+        "truncated": total > LIST_LIMIT,
+        "entries": entries,
+    }
 
 
 @app.post("/ai/confirm")

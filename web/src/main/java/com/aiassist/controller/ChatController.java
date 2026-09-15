@@ -23,6 +23,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
@@ -132,5 +133,16 @@ public class ChatController {
     @PostMapping("/workspace/open")
     public JsonNode openWorkspace() {
         return aiClient.openWorkspace();
+    }
+
+    /**
+     * 只读浏览工作区单层目录（阶段3.5 项目树）。
+     * root = 对话绑定的工作区绝对路径（空 = AI 默认工作区）；path = 相对子目录。
+     */
+    @GetMapping("/workspace/list")
+    public JsonNode listWorkspace(
+            @RequestParam(required = false) String root,
+            @RequestParam(required = false) String path) {
+        return aiClient.listWorkspace(root, path);
     }
 }
