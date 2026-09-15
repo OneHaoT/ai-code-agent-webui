@@ -13,6 +13,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  * @param images         当前消息图片（data URL 字符串，MIME 已内嵌在 data URL 中）
  * @param history        该会话已有消息历史（按时间顺序）
  * @param thinking       是否开启 DeepSeek 深度思考模式
+ * @param workspaceRoot  本轮对话要使用的工作区绝对路径（null=AI 默认工作区）
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record AiChatRequest(
@@ -20,6 +21,7 @@ public record AiChatRequest(
         String message,
         List<String> images,
         List<AiHistoryMessage> history,
-        Boolean thinking
+        Boolean thinking,
+        @JsonProperty("workspace_root") String workspaceRoot
 ) {
 }

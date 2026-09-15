@@ -37,6 +37,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# AI 模块默认工作区（用户可在此放临时项目文件，不入版本库）
+ai/workspace_default/
 
 # ========== 操作系统/编辑器杂项 ==========
 .DS_Store

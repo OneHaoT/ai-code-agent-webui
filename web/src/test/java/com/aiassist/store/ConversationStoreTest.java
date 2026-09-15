@@ -82,6 +82,12 @@ class ConversationStoreTest {
         return new ConversationEntity(CONV_ID, title, Instant.now(), Instant.now());
     }
 
+    private ConversationEntity convWithTitleAndWs(String title, String ws) {
+        ConversationEntity e = convWithTitle(title);
+        e.setWorkspaceRoot(ws);
+        return e;
+    }
+
     @Test
     void appendMessage_firstTextMessage_assignsSeqAndAutoTitle() {
         when(conversationMapper.selectById(CONV_ID)).thenReturn(convWithTitle(null));
@@ -199,7 +205,7 @@ class ConversationStoreTest {
     @Test
     void rename_missingConversation_returnsNull() {
         when(conversationMapper.selectById("nope")).thenReturn(null);
-        assertThat(store.rename("nope", "新标题")).isNull();
+        assertThat(store.update("nope", "新标题", null)).isNull();
     }
 
     @Test
@@ -207,10 +213,30 @@ class ConversationStoreTest {
         when(conversationMapper.selectById(CONV_ID))
                 .thenReturn(convWithTitle("旧标题"));
 
-        var updated = store.rename(CONV_ID, "新标题");
+        var updated = store.update(CONV_ID, "新标题", null);
 
         assertThat(updated.getTitle()).isEqualTo("新标题");
         verify(conversationMapper).update(isNull(), any(LambdaUpdateWrapper.class));
+    }
+
+    @Test
+    void update_workspaceRoot_clearsWhenEmptyString() {
+        when(conversationMapper.selectById(CONV_ID))
+                .thenReturn(convWithTitleAndWs("旧标题", "C:/tmp/proj"));
+
+        var updated = store.update(CONV_ID, null, "");
+
+        assertThat(updated.getWorkspaceRoot()).isNull();
+    }
+
+    @Test
+    void update_workspaceRoot_setsWhenProvided() {
+        when(conversationMapper.selectById(CONV_ID))
+                .thenReturn(convWithTitle("旧标题"));
+
+        var updated = store.update(CONV_ID, null, "D:/work/myproj");
+
+        assertThat(updated.getWorkspaceRoot()).isEqualTo("D:/work/myproj");
     }
 
     // ---------- 阶段1：工具轨迹持久化 ----------

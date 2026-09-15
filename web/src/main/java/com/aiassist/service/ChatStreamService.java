@@ -97,6 +97,7 @@ public class ChatStreamService {
             aiClient.streamChat(
                     prepared.conversationId(), prepared.content(),
                     prepared.currentImages(), prepared.history(), prepared.thinking(),
+                    prepared.workspaceRoot(),
                     new StreamHandler() {
                         @Override
                         public void onMeta(String model) {

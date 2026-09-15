@@ -48,8 +48,8 @@ public class ChatService {
         this.aiServiceProperties = aiServiceProperties;
     }
 
-    public Conversation createConversation(String title) {
-        return store.create(title);
+    public Conversation createConversation(String title, String workspaceRoot) {
+        return store.create(title, workspaceRoot);
     }
 
     public List<Conversation> listConversations() {
@@ -69,18 +69,26 @@ public class ChatService {
         return store.get(id);
     }
 
-    /** 手动重命名（标题去空白后 1~50 个 Unicode 码点），返回更新后的对话元数据 */
-    public Conversation renameConversation(String id, String title) {
-        String t = title == null ? "" : title.trim();
-        if (t.isEmpty()) {
-            throw new IllegalArgumentException("标题不能为空");
+    /** 更新对话元数据：title 和 workspaceRoot 都是可选字段（null 表示不更新）。 */
+    public Conversation updateConversation(String id, String title, String workspaceRoot) {
+        String trimmedTitle = null;
+        if (title != null) {
+            String t = title.trim();
+            if (t.isEmpty()) {
+                throw new IllegalArgumentException("标题不能为空");
+            }
+            if (t.codePointCount(0, t.length()) > 50) {
+                throw new IllegalArgumentException("标题最多 50 个字符");
+            }
+            trimmedTitle = t;
         }
-        if (t.codePointCount(0, t.length()) > 50) {
-            throw new IllegalArgumentException("标题最多 50 个字符");
+        // workspaceRoot：空串视为清空（设为 null），null 表示不更新
+        String ws = workspaceRoot;
+        if (workspaceRoot != null && workspaceRoot.trim().isEmpty()) {
+            ws = "";
         }
-        Conversation updated = store.rename(id, t);
+        Conversation updated = store.update(id, trimmedTitle, ws);
         if (updated == null) {
-            // 契约 7.1-6：重命名不存在的对话 → 404（资源不存在语义，非请求非法）
             throw new ResourceNotFoundException("对话不存在: " + id);
         }
         return updated;
@@ -94,7 +102,9 @@ public class ChatService {
             Message userMessage,
             List<AiHistoryMessage> history,
             List<String> currentImages,
-            boolean thinking
+            boolean thinking,
+            /** 该对话绑定的 workspace_root（null 表示 AI 默认） */
+            String workspaceRoot
     ) {
     }
 
@@ -138,7 +148,7 @@ public class ChatService {
         Message saved = store.appendMessage(conversationId, userMsg);
 
         return new PreparedChat(conversationId, content, refs, saved,
-                historyDto, currentImages, thinking);
+                historyDto, currentImages, thinking, conv.getWorkspaceRoot());
     }
 
     /**

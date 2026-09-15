@@ -19,7 +19,7 @@ import os
 import json
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
@@ -29,7 +29,7 @@ from langchain_openai import ChatOpenAI
 
 from memory_manager import MemoryManager
 from agent import iter_agent_events
-from workspace import Workspace
+from workspace import Workspace, PROJECT_ROOT
 
 logger = logging.getLogger("ai-assist")
 
@@ -83,17 +83,21 @@ if REASONING_EFFORT not in {"low", "high", "max"}:
 TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
-# 工具可访问的工作区根；留空默认项目根（ai/ 的上一级）
-WORKSPACE_ROOT = os.getenv("WORKSPACE_ROOT", "").strip()
+# 默认工作区根：当请求未指定 workspace_root 时使用。
+# 与阶段1的 WORKSPACE_ROOT 区分开——WORKSPACE_ROOT 也留空默认 ai/workspace_default/
+DEFAULT_WORKSPACE_DIR = PROJECT_ROOT / "ai" / "workspace_default"
+DEFAULT_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+# 向后兼容：若仍有 WORKSPACE_ROOT env 变量，用作默认值覆盖默认目录
+_LEGACY_WR = os.getenv("WORKSPACE_ROOT", "").strip() or None
+_default_ws_root = _LEGACY_WR or str(DEFAULT_WORKSPACE_DIR)
+workspace = Workspace(_default_ws_root)
 # 单轮对话内工具循环的最大轮数（防无限调用烧钱）
 try:
     MAX_TOOL_ITERATIONS = max(1, int(os.getenv("MAX_TOOL_ITERATIONS", "8")))
 except ValueError:
     logger.warning("MAX_TOOL_ITERATIONS 非法，回退 8")
     MAX_TOOL_ITERATIONS = 8
-
-workspace = Workspace(WORKSPACE_ROOT or None)
-logger.info("工具调用: enabled=%s, workspace=%s, max_iterations=%s",
+logger.info("工具调用: enabled=%s, default_workspace=%s, max_iterations=%s",
             TOOLS_ENABLED, workspace.root, MAX_TOOL_ITERATIONS)
 
 SYSTEM_PROMPT = (
@@ -223,6 +227,8 @@ class ChatRequest(_ImagesModel):
     history: list[MessageItem] = []
     # 是否开启深度思考（thinking 模式），由前端开关控制
     thinking: bool = False
+    # 本轮对话要使用的工作区根（可选；空则用 DEFAULT_WORKSPACE_DIR）
+    workspace_root: str | None = None
 
 
 # ---------------- 接口 ----------------
@@ -305,9 +311,63 @@ def health():
         "thinking_supported": True,
         "reasoning_effort": REASONING_EFFORT,
         "tools_enabled": TOOLS_ENABLED,
-        "workspace_root": str(workspace.root),
+        "default_workspace": str(workspace.root),
         "max_tool_iterations": MAX_TOOL_ITERATIONS,
     }
+
+
+# ---------------- 阶段2：工作区文件上传与打开 ----------------
+
+# 上传文件到 AI 默认工作区（用于"拖单个文件 → 复制到默认工作区 → AI 可读"场景）
+# 限制：单文件 ≤ 10 MB，文件名不允许路径穿越
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+@app.post("/workspace/files")
+async def upload_workspace_file(file: UploadFile = File(...)):
+    """把前端拖入/选择的单个文件保存到 AI 默认工作区，返回保存结果。"""
+    name = os.path.basename(file.filename or "upload")
+    if not name or name in ("", ".", ".."):
+        raise HTTPException(400, "文件名非法")
+    target = DEFAULT_WORKSPACE_DIR / name
+
+    # 防止目录穿越（basename 已取但再校验一次）
+    if not str(target.resolve()).startswith(str(DEFAULT_WORKSPACE_DIR.resolve())):
+        raise HTTPException(400, "文件路径越出默认工作区")
+
+    size = 0
+    with target.open("wb") as out:
+        while True:
+            chunk = await file.read(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                out.close()
+                target.unlink(missing_ok=True)
+                raise HTTPException(413, f"文件超过 {MAX_UPLOAD_BYTES // 1024 // 1024}MB")
+            out.write(chunk)
+
+    logger.info("workspace_upload saved name=%s size=%d path=%s", name, size, target)
+    return {"name": name, "size": size, "path": str(target)}
+
+
+@app.post("/workspace/open")
+def open_workspace():
+    """在操作系统文件浏览器中打开 AI 默认工作区目录。"""
+    import subprocess
+    import sys
+    path = str(DEFAULT_WORKSPACE_DIR.resolve())
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # Windows
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as e:
+        raise HTTPException(500, f"打开目录失败：{e}")
+    return {"path": path}
 
 
 @app.post("/ai/chat/stream")
@@ -335,6 +395,17 @@ def chat_stream(req: ChatRequest):
     oai_messages = _build_messages(req)
     base_kwargs = _base_create_kwargs(req)
 
+    # Per-request workspace：优先用请求指定的 workspace_root，
+    # 否则回退到启动时的默认工作区
+    request_workspace_root = (req.workspace_root or "").strip()
+    if request_workspace_root:
+        active_ws = Workspace(request_workspace_root)
+    else:
+        # 走默认：用模块级 workspace（已在启动时解析好）
+        active_ws = workspace
+    logger.debug("workspace_for_conversation conv=%s workspace=%s",
+                 req.conversation_id, active_ws.root)
+
     def event_generator():
         yield _sse("meta", {"model": DEEPSEEK_MODEL})
         answer_parts: list[str] = []
@@ -343,7 +414,7 @@ def chat_stream(req: ChatRequest):
             for evt in iter_agent_events(
                     get_client(), oai_messages,
                     base_kwargs=base_kwargs,
-                    workspace=workspace,
+                    workspace=active_ws,
                     max_iterations=MAX_TOOL_ITERATIONS,
                     tools_enabled=TOOLS_ENABLED):
                 etype = evt.get("type")

@@ -19,10 +19,13 @@ async function request(path, options = {}) {
 
 export const api = {
   listConversations: () => request('/api/conversations'),
-  createConversation: (title) =>
+  createConversation: (title, workspaceRoot) =>
     request('/api/conversations', {
       method: 'POST',
-      body: JSON.stringify({ title: title || null })
+      body: JSON.stringify({
+        title: title || null,
+        workspaceRoot: workspaceRoot || null
+      })
     }),
   deleteConversation: (id) =>
     request(`/api/conversations/${id}`, { method: 'DELETE' }),
@@ -32,6 +35,29 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ title })
     }),
+  updateConversation: (id, { title, workspaceRoot }) =>
+    request(`/api/conversations/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        ...(title !== undefined && { title }),
+        ...(workspaceRoot !== undefined && { workspaceRoot })
+      })
+    }),
+  /** 前端上传单文件（multipart/form-data）到默认工作区 */
+  uploadWorkspaceFile: (file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch('/api/workspace/files', {
+      method: 'POST',
+      body: fd
+    }).then((r) => {
+      if (!r.ok) throw new Error(`上传失败 ${r.status}`)
+      return r.json()
+    })
+  },
+  /** 让 AI 模块在本机文件浏览器打开默认工作区 */
+  openWorkspace: () =>
+    request('/api/workspace/open', { method: 'POST' }),
 
   /**
    * 上传图片（multipart 不能带 JSON Content-Type，浏览器自动设置 boundary）

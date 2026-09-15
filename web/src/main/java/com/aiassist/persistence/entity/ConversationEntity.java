@@ -20,6 +20,8 @@ public class ConversationEntity {
 
     private String title;
 
+    private String workspaceRoot;
+
     private Instant createdAt;
 
     private Instant updatedAt;
@@ -38,6 +40,8 @@ public class ConversationEntity {
     public void setId(String id) { this.id = id; }
     public String getTitle() { return title; }
     public void setTitle(String title) { this.title = title; }
+    public String getWorkspaceRoot() { return workspaceRoot; }
+    public void setWorkspaceRoot(String workspaceRoot) { this.workspaceRoot = workspaceRoot; }
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }

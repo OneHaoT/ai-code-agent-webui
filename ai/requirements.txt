@@ -8,5 +8,9 @@ openai>=1.40.0
 # 阶段1：只读工具调用循环（StateGraph + custom stream writer）
 langgraph>=1.2.11
 
+# 阶段2：工作区 PDF/Markdown 文档读取 + 文件上传
+PyMuPDF>=1.24.0
+python-multipart>=0.0.9
+
 # 测试（tests/）
 pytest>=8.0.0

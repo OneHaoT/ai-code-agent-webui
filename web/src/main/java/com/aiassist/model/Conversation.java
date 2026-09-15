@@ -13,6 +13,8 @@ public class Conversation {
 
     private String id;
     private String title;
+    /** 绑定的 Agent 工作区绝对路径（null/空串表示走 AI 默认工作区） */
+    private String workspaceRoot;
     private Instant createdAt;
     private Instant updatedAt;
     private List<Message> messages = new ArrayList<>();
@@ -35,6 +37,8 @@ public class Conversation {
     public void setId(String id) { this.id = id; }
     public String getTitle() { return title; }
     public void setTitle(String title) { this.title = title; }
+    public String getWorkspaceRoot() { return workspaceRoot; }
+    public void setWorkspaceRoot(String workspaceRoot) { this.workspaceRoot = workspaceRoot; }
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }

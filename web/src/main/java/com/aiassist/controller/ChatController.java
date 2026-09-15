@@ -1,5 +1,6 @@
 package com.aiassist.controller;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
@@ -12,6 +13,8 @@ import com.aiassist.model.Conversation;
 import com.aiassist.service.AiClient;
 import com.aiassist.service.ChatService;
 import com.aiassist.service.ChatStreamService;
+import com.fasterxml.jackson.databind.JsonNode;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -19,7 +22,9 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 /**
@@ -51,7 +56,8 @@ public class ChatController {
     @PostMapping("/conversations")
     public Conversation createConversation(@RequestBody(required = false) CreateConversationRequest body) {
         String title = body == null ? null : body.title();
-        return chatService.createConversation(title);
+        String ws = body == null ? null : body.workspaceRoot();
+        return chatService.createConversation(title, ws);
     }
 
     /** 删除对话 */
@@ -73,11 +79,13 @@ public class ChatController {
         return c;
     }
 
-    /** 手动重命名对话 */
+    /** 更新对话元数据（标题 / 工作区；均可选） */
     @PatchMapping("/conversations/{id}")
-    public Conversation renameConversation(@PathVariable String id,
-                                           @RequestBody RenameConversationRequest body) {
-        return chatService.renameConversation(id, body == null ? null : body.title());
+    public Conversation updateConversation(@PathVariable String id,
+                                           @RequestBody(required = false) RenameConversationRequest body) {
+        String title = body == null ? null : body.title();
+        String ws = body == null ? null : body.workspaceRoot();
+        return chatService.updateConversation(id, title, ws);
     }
 
     /** 流式发送消息（SSE）；校验失败在响应头提交前返回 400 */
@@ -90,5 +98,22 @@ public class ChatController {
     @GetMapping("/ai/status")
     public AiHealthResponse aiStatus() {
         return aiClient.health();
+    }
+
+    /** 把前端拖入的单个文件保存到 AI 默认工作区 */
+    @PostMapping(value = "/workspace/files", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public JsonNode uploadWorkspaceFile(@RequestPart("file") MultipartFile file) throws IOException {
+        if (file.isEmpty()) {
+            throw new IllegalArgumentException("文件为空");
+        }
+        return aiClient.uploadWorkspaceFile(
+                file.getOriginalFilename() != null ? file.getOriginalFilename() : "upload",
+                file.getBytes());
+    }
+
+    /** 让 AI 模块在本机文件浏览器中打开默认工作区 */
+    @PostMapping("/workspace/open")
+    public JsonNode openWorkspace() {
+        return aiClient.openWorkspace();
     }
 }

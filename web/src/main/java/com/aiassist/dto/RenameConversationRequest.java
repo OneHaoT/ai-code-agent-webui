@@ -1,8 +1,11 @@
 package com.aiassist.dto;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
 /**
- * 手动重命名对话请求体。
- * title 必填（去空白后非空），长度上限由 Service 层校验。
+ * 更新对话元数据请求体（title 和 workspaceRoot 都可选，只传要改的字段）。
+ * null 表示不更新；空字符串视为清空。
  */
-public record RenameConversationRequest(String title) {
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record RenameConversationRequest(String title, String workspaceRoot) {
 }

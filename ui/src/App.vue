@@ -3,6 +3,7 @@ import { ref, reactive, onMounted, onBeforeUnmount, computed } from 'vue'
 import { api } from './api.js'
 import Sidebar from './components/Sidebar.vue'
 import ChatView from './components/ChatView.vue'
+import WorkspacePanel from './components/WorkspacePanel.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ToastHost from './components/ToastHost.vue'
 import { useToast } from './composables/useToast.js'
@@ -14,6 +15,13 @@ const currentId = ref(null)
 const messages = ref([])
 const loadingConvs = ref(false)
 const sending = ref(false)
+// 侧边栏折叠状态（持久化到 localStorage，默认展开）
+const sidebarCollapsed = ref(localStorage.getItem('sidebarCollapsed') === '1')
+// 右侧工作区面板折叠状态
+const workspaceCollapsed = ref(localStorage.getItem('workspaceCollapsed') === '1')
+// 全局有效工作区：新对话用它绑定；selectConversation 时用 conv.workspaceRoot 覆盖
+// null 表示走 AI 默认工作区（ai/workspace_default/）
+const activeWorkspace = ref(null)
 // 图片上传阶段（与 AI 流式阶段区分，驱动"正在上传图片…"指示）
 const uploading = ref(false)
 // 本轮是否有任何进行中的请求（上传或流式），用于切对话/新建/删除守卫
@@ -107,9 +115,13 @@ function onBeforeUnload(e) {
 }
 
 // 兜底：文件拖到聊天区以外（侧边栏/窗口边缘）松手时，
-// 阻止浏览器默认行为（直接打开本地文件导致整个应用页面被替换）
+// 阻止浏览器默认行为（直接打开本地文件导致整个应用页面被替换）。
+// 但右侧 WorkspacePanel 需要接受文件夹拖拽，放行它的 drop zone。
 function blockWindowFileDrop(e) {
   if (Array.from(e.dataTransfer?.types || []).includes('Files')) {
+    // 如果拖到了工作区面板区域，让它自己的 handler 接管
+    const target = e.target
+    if (target?.closest?.('.workspace-panel')) return
     e.preventDefault()
   }
 }
@@ -134,7 +146,7 @@ async function createConversation() {
   // 发送流程中禁止新建：否则列表插入空对话项但无法切换，产生幽灵条目
   if (busy.value) return
   try {
-    const c = await api.createConversation('')
+    const c = await api.createConversation('', activeWorkspace.value || null)
     conversations.value.unshift(c)
     await selectConversation(c.id)
   } catch (e) {
@@ -148,6 +160,8 @@ async function selectConversation(id) {
   try {
     const c = await api.getConversation(id)
     messages.value = c.messages || []
+    // 同步该对话的工作区
+    activeWorkspace.value = c.workspaceRoot || null
     // 更新列表中该对话(可能标题已更新)
     const idx = conversations.value.findIndex((x) => x.id === id)
     if (idx >= 0) conversations.value[idx] = c
@@ -172,6 +186,7 @@ async function deleteConversation(id) {
     if (currentId.value === id) {
       currentId.value = null
       messages.value = []
+      // 工作区保留不变——用户可能想基于同一工作区新建下一个对话
       if (conversations.value.length) {
         await selectConversation(conversations.value[0].id)
       }
@@ -381,6 +396,39 @@ function stopGeneration() {
   abortController?.abort()
 }
 
+/** 切换侧边栏折叠状态（持久化到 localStorage） */
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  localStorage.setItem('sidebarCollapsed', sidebarCollapsed.value ? '1' : '0')
+}
+
+/** 切换右侧工作区面板折叠状态 */
+function toggleWorkspacePanel() {
+  workspaceCollapsed.value = !workspaceCollapsed.value
+  localStorage.setItem('workspaceCollapsed', workspaceCollapsed.value ? '1' : '0')
+}
+
+/** 工作区变更（WorkspacePanel 拖入文件夹确认后触发） */
+async function onWorkspaceChange(rootPath) {
+  activeWorkspace.value = rootPath || null
+  // 持久化到后端：PATCH 当前对话的 workspace_root
+  if (currentId.value) {
+    try {
+      const updated = await api.updateConversation(currentId.value, {
+        workspaceRoot: rootPath || ''
+      })
+      // 同步侧栏/列表中该对话的 workspaceRoot
+      const idx = conversations.value.findIndex((c) => c.id === currentId.value)
+      if (idx >= 0 && updated) conversations.value[idx] = updated
+      toast.success(rootPath
+        ? `工作区已切换：${rootPath}`
+        : '已切回默认工作区')
+    } catch (e) {
+      toast.error('工作区切换失败：' + e.message)
+    }
+  }
+}
+
 /**
  * 失败消息重试：失败气泡充当草稿——文本直接复用，图片从本地 objectURL
  * 还原为 File 重新上传；移除失败气泡和紧随其后的错误气泡后重新发送。
@@ -423,6 +471,7 @@ async function retrySend(failedMsg) {
       :current-id="currentId"
       :loading="loadingConvs"
       :busy="busy"
+      :collapsed="sidebarCollapsed"
       @new="createConversation"
       @select="selectConversation"
       @delete="deleteConversation"
@@ -435,10 +484,21 @@ async function retrySend(failedMsg) {
       :uploading="uploading"
       :pending-thinking="pendingThinking"
       :ai-status="aiStatus"
+      :sidebar-collapsed="sidebarCollapsed"
+      :workspace-collapsed="workspaceCollapsed"
+      @toggle-sidebar="toggleSidebar"
+      @toggle-workspace="toggleWorkspacePanel"
       @send="sendMessage"
       @stop="stopGeneration"
       @retry="retrySend"
       @new="createConversation"
+    />
+    <WorkspacePanel
+      :workspace-root="activeWorkspace"
+      :default-workspace="aiStatus.default_workspace"
+      :collapsed="workspaceCollapsed"
+      @toggle="toggleWorkspacePanel"
+      @workspace-change="onWorkspaceChange"
     />
 
     <ConfirmDialog

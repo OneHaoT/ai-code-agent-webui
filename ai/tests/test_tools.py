@@ -519,3 +519,46 @@ def test_tool_schemas_complete():
     assert required_map["list_dir"] == []
     assert required_map["glob"] == ["pattern"]
     assert required_map["grep"] == ["pattern"]
+
+
+# ---------------- read_file：PDF 文档分支（阶段2） ----------------
+
+def _make_pdf(path, pages):
+    """用 PyMuPDF 现场生成多页 PDF；pages 是每页的文本行列表（ASCII 保提取可靠）。"""
+    import fitz
+    doc = fitz.open()
+    for lines in pages:
+        page = doc.new_page()
+        y = 72
+        for line in lines:
+            page.insert_text((72, y), line)
+            y += 20
+    doc.save(str(path))
+    doc.close()
+
+
+def test_read_file_pdf_multi_page(ws):
+    """PDF 走 PyMuPDF 提取：按页标注 [pN] 前缀，行号从 1 连续编号。"""
+    _make_pdf(ws.root / "doc.pdf", [["alpha first"], ["beta second"]])
+    out = tools.read_file(ws, "doc.pdf")
+    assert out.status == "success"
+    assert "[p1]" in out.output and "alpha first" in out.output
+    assert "[p2]" in out.output and "beta second" in out.output
+    assert out.truncated is False
+
+
+def test_read_file_pdf_offset_limit(ws):
+    """PDF 同样支持 offset/limit 续读：offset 按提取后的连续行计数。"""
+    _make_pdf(ws.root / "doc.pdf", [["line-one", "line-two", "line-three"]])
+    out = tools.read_file(ws, "doc.pdf", offset=2, limit=1)
+    assert out.status == "success"
+    assert "2 | [p1] line-two" in out.output
+    assert "line-one" not in out.output and "line-three" not in out.output
+
+
+def test_read_file_pdf_corrupted_is_error(ws):
+    """损坏的 PDF 收敛为 error（不抛异常、不中断工具循环）。"""
+    (ws.root / "bad.pdf").write_bytes(b"this is not a pdf at all")
+    out = tools.read_file(ws, "bad.pdf")
+    assert out.status == "error"
+    assert "PDF" in out.output

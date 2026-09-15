@@ -175,6 +175,32 @@ def _resolve_target(ws: Workspace, path, name: str, *, expect: str | None = None
 
 # ---------------- read_file ----------------
 
+def _is_readable_document(suffix: str) -> bool:
+    """当前已知可转文本的文档扩展名。"""
+    return suffix.lower() in {".pdf"}
+
+
+def _extract_pdf_text(path: Path) -> list[str] | None:
+    """用 PyMuPDF 把 PDF 每页提文本并按页分行；失败返回 None。"""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return None
+    try:
+        doc = fitz.open(str(path))
+        lines: list[str] = []
+        for page_idx, page in enumerate(doc):
+            page_no = page_idx + 1
+            text = page.get_text("text") or ""
+            for line in text.splitlines():
+                if line.strip():
+                    lines.append(f"[p{page_no}] {line}")
+        doc.close()
+        return lines
+    except Exception as e:
+        return None
+
+
 def read_file(ws: Workspace, path: str, offset=None, limit=None) -> ToolOutput:
     name = "read_file"
     target, err = _resolve_target(ws, path, name, expect="file")
@@ -192,9 +218,20 @@ def read_file(ws: Workspace, path: str, offset=None, limit=None) -> ToolOutput:
 
     try:
         size = target.stat().st_size
+        # ---- PDF 分支 ----
+        suffix = target.suffix
+        if _is_readable_document(suffix):
+            pdf_lines = _extract_pdf_text(target)
+            if pdf_lines is None:
+                return _error(name, f"PDF 解析失败（需 PyMuPDF 依赖且文件未损坏）：{ws.relative(target)}")
+            # PDF 走纯文本行流程
+            return _format_lines_output(
+                name=name, ws=ws, target=target, size=size,
+                lines=pdf_lines, offset_v=offset_v, limit_v=limit_v,
+                start_line=offset_v, unit_hint="行（PDF 提取）")
+
+        # ---- 普通文本分支 ----
         with target.open("rb") as f:
-            # 采样整个可输出窗口（≤MAX_BYTES）而非仅前 8KB：
-            # 防"开头是合法文本、后段夹带二进制"漏判
             sample = f.read(MAX_BYTES)
         if _looks_binary(sample):
             return _error(name, f"疑似二进制文件，已拒绝读取：{ws.relative(target)}")
@@ -202,7 +239,6 @@ def read_file(ws: Workspace, path: str, offset=None, limit=None) -> ToolOutput:
         selected: list[bytes] = []
         byte_count = 0
         truncated = False
-        total_hint = ""
         with target.open("rb") as f:
             for lineno, raw in enumerate(f, start=1):
                 if lineno < offset_v:
@@ -211,8 +247,6 @@ def read_file(ws: Workspace, path: str, offset=None, limit=None) -> ToolOutput:
                     truncated = True
                     break
                 window = raw.rstrip(b"\r\n")
-                # 输出窗口逐行复检：头部 128KB 采样可能全是合法文本，深 offset
-                # 实际输出的行（>MAX_BYTES 处）头部采样覆盖不到，必须逐行防 NUL
                 if b"\x00" in window:
                     return _error(
                         name,
@@ -220,26 +254,51 @@ def read_file(ws: Workspace, path: str, offset=None, limit=None) -> ToolOutput:
                         f"（第 {lineno} 行附近检测到非文本字节）")
                 selected.append(window)
                 byte_count += len(raw)
+        total_hint = ""
         if truncated and size <= COUNT_LINES_MAX_BYTES:
-            # 补一个总行数（仅对不太大的文件），提示模型可用 offset 续读
             with target.open("rb") as f:
                 total = sum(1 for _ in f)
             total_hint = f"，文件共 {total} 行"
+        # 解码成字符串行，统一交给 _format_lines_output 处理
+        # 文本分支已在上面按 offset_v 跳过前缀，selected[0] 就是源文件第 offset_v 行
+        text_lines = [_decode(b) for b in selected]
+        return _format_lines_output(
+            name=name, ws=ws, target=target, size=size,
+            lines=text_lines, offset_v=1, limit_v=limit_v,
+            start_line=offset_v,
+            truncated_early=truncated, total_hint=total_hint)
     except OSError as e:
         return _error(name, f"读取文件失败：{e}")
 
+
+def _format_lines_output(*, name: str, ws: Workspace, target: Path,
+                         size: int, lines: list[str], offset_v: int,
+                         limit_v: int, start_line: int,
+                         truncated_early: bool = False,
+                         total_hint: str = "", unit_hint: str = "行") -> ToolOutput:
+    """把一组字符串行按 offset/limit 切片、格式化 header/body，生成 ToolOutput。
+
+    start_line: 传入 lines 列表第一行在源文件中的原始行号（文本分支已按 offset 跳过
+                前缀，PDF 分支未跳过——调用方传实际值即可）。
+    """
+    end_in_lines = offset_v - 1 + limit_v
+    selected = lines[offset_v - 1:end_in_lines]
+    truncated = truncated_early or len(lines) > end_in_lines
+    if truncated and not total_hint and size <= COUNT_LINES_MAX_BYTES:
+        total_hint = f"，文件共 {len(lines)} {unit_hint}"
+
     rel = ws.relative(target)
-    width = len(str(offset_v + len(selected) - 1)) if selected else len(str(offset_v))
+    width = len(str(start_line + len(selected) - 1)) if selected else len(str(start_line))
     header = f"[文件] {rel} | {_human_size(size)}{total_hint}"
     if not selected:
-        body = "（指定范围内没有内容；offset 可能超过文件行数）" if offset_v > 1 else "（空文件）"
+        body = "（指定范围内没有内容；offset 可能超过文件行数）" if start_line > 1 else "（空文件）"
     else:
         body = "\n".join(
-            f"{str(offset_v + i).rjust(width)} | {_decode(line)}"
+            f"{str(start_line + i).rjust(width)} | {line}"
             for i, line in enumerate(selected)
         )
     if truncated:
-        body += (f"\n…（仅显示自第 {offset_v} 行起最多 {limit_v} 行 / "
+        body += (f"\n…（仅显示自第 {start_line} 行起最多 {limit_v} 行 / "
                  f"{MAX_BYTES // 1024}KB 内容{total_hint}，需要后续内容请加大 offset 续读）")
     return ToolOutput(name=name, status="success",
                       output=f"{header}\n{body}", truncated=truncated)

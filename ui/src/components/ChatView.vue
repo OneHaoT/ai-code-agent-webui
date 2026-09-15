@@ -11,9 +11,13 @@ const props = defineProps({
   sending: { type: Boolean, default: false },
   uploading: { type: Boolean, default: false },
   pendingThinking: { type: Boolean, default: false },
-  aiStatus: { type: Object, default: () => ({}) }
+  aiStatus: { type: Object, default: () => ({}) },
+  // 侧边栏折叠状态（控制 toggle 按钮图标）
+  sidebarCollapsed: { type: Boolean, default: false },
+  // 右侧工作区面板折叠状态
+  workspaceCollapsed: { type: Boolean, default: false }
 })
-const emit = defineEmits(['send', 'stop', 'retry', 'new'])
+const emit = defineEmits(['send', 'stop', 'retry', 'new', 'toggle-sidebar', 'toggle-workspace'])
 
 const toast = useToast()
 
@@ -133,7 +137,18 @@ watch(
     @drop="onDrop"
   >
     <header class="chat-head">
-      <div class="title">
+      <div class="head-left">
+        <button class="toggle-sidebar" title="切换侧边栏" @click="emit('toggle-sidebar')">
+          <svg v-if="sidebarCollapsed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <path d="M15 3v18"/>
+          </svg>
+          <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <path d="M9 3v18"/>
+          </svg>
+        </button>
+        <div class="title">
         <span
           class="dot"
           :class="{ on: aiOnline && !keyMissing, off: !aiOnline, warn: aiOnline && keyMissing }"
@@ -142,11 +157,24 @@ watch(
             : 'AI 模块不可达（每 30 秒自动重试）'"
         ></span>
         {{ conv ? conv.title || '新对话' : 'AI 智能辅助编程' }}
+        </div>
       </div>
-      <button class="head-new" :disabled="sending || uploading" @click="emit('new')">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-        新对话
-      </button>
+      <div class="head-right">
+        <button class="head-new" :disabled="sending || uploading" @click="emit('new')">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          新对话
+        </button>
+        <button class="toggle-sidebar" title="切换工作区面板" @click="emit('toggle-workspace')">
+          <svg v-if="workspaceCollapsed" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <path d="M9 3v18"/>
+          </svg>
+          <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <path d="M15 3v18"/>
+          </svg>
+        </button>
+      </div>
     </header>
 
     <div v-if="!aiOnline" class="warn warn-offline">
@@ -296,6 +324,36 @@ watch(
   padding: 0 22px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+  gap: 12px;
+}
+.head-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.head-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.toggle-sidebar {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.toggle-sidebar:hover {
+  background: var(--surface-2);
+  color: var(--accent);
 }
 .title {
   display: flex;

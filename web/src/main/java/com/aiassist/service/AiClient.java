@@ -17,10 +17,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
 import org.springframework.util.StreamUtils;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
@@ -73,9 +77,10 @@ public class AiClient {
      */
     public void streamChat(String conversationId, String message,
                            List<String> images, List<AiHistoryMessage> history,
-                           boolean thinking, StreamHandler handler) {
+                           boolean thinking, String workspaceRoot, StreamHandler handler) {
         AiChatRequest request =
-                new AiChatRequest(conversationId, message, images, history, thinking);
+                new AiChatRequest(conversationId, message, images, history, thinking,
+                        workspaceRoot == null || workspaceRoot.isBlank() ? null : workspaceRoot);
 
         try {
             restClient.post()
@@ -241,5 +246,38 @@ public class AiClient {
             log.warn("AI 模块健康检查失败: {}", e.getMessage());
             return AiHealthResponse.unreachable(e.getMessage());
         }
+    }
+
+    /**
+     * 把前端上传的文件转发给 AI 模块 POST /workspace/files，保存到默认工作区。
+     */
+    public JsonNode uploadWorkspaceFile(String filename, byte[] data) {
+        Resource fileResource = new ByteArrayResource(data) {
+            @Override public String getFilename() { return filename; }
+        };
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("file", fileResource);
+        return restClient.post()
+                .uri("/workspace/files")
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .body(body)
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (req, res) -> {
+                    throw new AiServiceException("上传失败: " + res.getStatusCode());
+                })
+                .body(JsonNode.class);
+    }
+
+    /** 让 AI 模块在本机文件浏览器中打开默认工作区目录。 */
+    public JsonNode openWorkspace() {
+        return restClient.post()
+                .uri("/workspace/open")
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (req, res) -> {
+                    throw new AiServiceException("打开工作区失败: " + res.getStatusCode());
+                })
+                .body(JsonNode.class);
     }
 }

@@ -6,7 +6,9 @@ const props = defineProps({
   currentId: { type: String, default: null },
   loading: { type: Boolean, default: false },
   // 请求进行中（上传/流式）：禁止新建，避免与发送守卫产生幽灵对话
-  busy: { type: Boolean, default: false }
+  busy: { type: Boolean, default: false },
+  // 侧边栏是否折叠（宽度过渡到 0）
+  collapsed: { type: Boolean, default: false }
 })
 const emit = defineEmits(['new', 'select', 'delete', 'rename'])
 
@@ -41,7 +43,7 @@ function cancelEdit() {
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ collapsed: collapsed }">
     <div class="brand">
       <div class="logo">AI</div>
       <div class="brand-text">
@@ -106,6 +108,12 @@ function cancelEdit() {
   display: flex;
   flex-direction: column;
   height: 100%;
+  overflow: hidden;
+  transition: width 0.25s ease, border-color 0.25s ease;
+}
+.sidebar.collapsed {
+  width: 0;
+  border-right-color: transparent;
 }
 .brand {
   display: flex;

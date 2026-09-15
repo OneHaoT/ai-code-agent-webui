@@ -84,13 +84,16 @@ public class ConversationStore {
     // ---------- 对话 ----------
 
     @Transactional
-    public Conversation create(String title) {
+    public Conversation create(String title, String workspaceRoot) {
         Instant now = Instant.now();
         String id = UUID.randomUUID().toString().replace("-", "");
         ConversationEntity entity = new ConversationEntity(
                 id, title == null || title.isBlank() ? null : title, now, now);
+        entity.setWorkspaceRoot(workspaceRoot == null || workspaceRoot.isBlank() ? null : workspaceRoot);
         conversationMapper.insert(entity);
-        return new Conversation(id, entity.getTitle(), now, now);
+        Conversation c = new Conversation(id, entity.getTitle(), now, now);
+        c.setWorkspaceRoot(entity.getWorkspaceRoot());
+        return c;
     }
 
     /** 完整聚合：含全部消息（按 seq）与图片引用 */
@@ -115,6 +118,7 @@ public class ConversationStore {
 
         Conversation conv = new Conversation(
                 entity.getId(), entity.getTitle(), entity.getCreatedAt(), entity.getUpdatedAt());
+        conv.setWorkspaceRoot(entity.getWorkspaceRoot());
         List<Message> result = new ArrayList<>();
         for (MessageEntity me : messages) {
             List<ImageRef> refs = imagesByMessage
@@ -149,7 +153,12 @@ public class ConversationStore {
                         new LambdaQueryWrapper<ConversationEntity>()
                                 .orderByDesc(ConversationEntity::getUpdatedAt))
                 .stream()
-                .map(c -> new Conversation(c.getId(), c.getTitle(), c.getCreatedAt(), c.getUpdatedAt()))
+                .map(c -> {
+                    Conversation conv = new Conversation(c.getId(), c.getTitle(),
+                            c.getCreatedAt(), c.getUpdatedAt());
+                    conv.setWorkspaceRoot(c.getWorkspaceRoot());
+                    return conv;
+                })
                 .toList();
     }
 
@@ -160,21 +169,36 @@ public class ConversationStore {
     }
 
     /**
-     * 手动重命名：立即落库并刷新 updatedAt，返回更新后的对话元数据（不含消息）。
-     * 对话不存在返回 null（由 Service 层转成参数异常）。
+     * 更新对话元数据：title 和 workspaceRoot 都可选。
+     * null 表示不改该列；空字符串表示清空该列（置为 NULL）。
      */
     @Transactional
-    public Conversation rename(String id, String title) {
+    public Conversation update(String id, String title, String workspaceRoot) {
         ConversationEntity entity = conversationMapper.selectById(id);
         if (entity == null) {
             return null;
         }
         Instant now = Instant.now();
-        conversationMapper.update(null, new LambdaUpdateWrapper<ConversationEntity>()
-                .eq(ConversationEntity::getId, id)
-                .set(ConversationEntity::getTitle, title)
-                .set(ConversationEntity::getUpdatedAt, now));
-        return new Conversation(id, title, entity.getCreatedAt(), now);
+        LambdaUpdateWrapper<ConversationEntity> wrapper =
+                new LambdaUpdateWrapper<ConversationEntity>()
+                        .eq(ConversationEntity::getId, id)
+                        .set(ConversationEntity::getUpdatedAt, now);
+        if (title != null) {
+            wrapper.set(ConversationEntity::getTitle, title);
+        }
+        if (workspaceRoot != null) {
+            wrapper.set(ConversationEntity::getWorkspaceRoot,
+                    workspaceRoot.isEmpty() ? null : workspaceRoot);
+        }
+        conversationMapper.update(null, wrapper);
+
+        Conversation c = new Conversation(id,
+                title != null ? title : entity.getTitle(),
+                entity.getCreatedAt(), now);
+        c.setWorkspaceRoot(workspaceRoot != null
+                ? (workspaceRoot.isEmpty() ? null : workspaceRoot)
+                : entity.getWorkspaceRoot());
+        return c;
     }
 
     // ---------- 消息 ----------

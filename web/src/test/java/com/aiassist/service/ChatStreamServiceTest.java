@@ -65,7 +65,7 @@ class ChatStreamServiceTest {
 
     private PreparedChat prepared() {
         return new PreparedChat("c1", "hi", List.of(),
-                new Message("user", "hi"), List.of(), List.of(), false);
+                new Message("user", "hi"), List.of(), List.of(), false, null);
     }
 
     private SendMessageRequest request() {
@@ -76,11 +76,11 @@ class ChatStreamServiceTest {
     void start_happyStream_completesAndSavesAssistantMessage() throws Exception {
         when(chatService.prepare(eq("c1"), any(), any(), eq(false))).thenReturn(prepared());
         doAnswer(inv -> {
-            StreamHandler handler = inv.getArgument(5);
+            StreamHandler handler = inv.getArgument(6);
             handler.onMeta("deepseek-flash");
             handler.onToken("你好");
             return null;
-        }).when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any());
+        }).when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any(), any());
         when(chatService.complete(any(), eq("你好"), isNull(), isNull()))
                 .thenReturn(new Message("assistant", "你好"));
 
@@ -103,7 +103,7 @@ class ChatStreamServiceTest {
         ObjectMapper mapper = new ObjectMapper();
         when(chatService.prepare(eq("c1"), any(), any(), eq(false))).thenReturn(prepared());
         doAnswer(inv -> {
-            StreamHandler handler = inv.getArgument(5);
+            StreamHandler handler = inv.getArgument(6);
             handler.onMeta("deepseek-flash");
             handler.onToolCall("s1", "read_file",
                     mapper.readTree("{\"path\":\"a.txt\"}"), null);
@@ -112,7 +112,7 @@ class ChatStreamServiceTest {
             handler.onToolResult("s2", "read_file", "error", "参数错误", true);
             handler.onToken("答案");
             return null;
-        }).when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any());
+        }).when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any(), any());
         when(chatService.complete(any(), eq("答案"), isNull(), anyList()))
                 .thenReturn(new Message("assistant", "答案"));
 
@@ -187,7 +187,7 @@ class ChatStreamServiceTest {
     void start_aiFailure_rollsBackAndCompletesWithErrorFrame() {
         when(chatService.prepare(eq("c1"), any(), any(), eq(false))).thenReturn(prepared());
         doThrow(new AiServiceException("AI 模块不可用"))
-                .when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any());
+                .when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any(), any());
 
         try (MockedConstruction<SseEmitter> mocked = mockConstruction(SseEmitter.class)) {
             streamService.start("c1", request());
@@ -202,9 +202,9 @@ class ChatStreamServiceTest {
     void start_emptyAnswer_treatedAsFailureAndRollsBack() {
         when(chatService.prepare(eq("c1"), any(), any(), eq(false))).thenReturn(prepared());
         doAnswer(inv -> {
-            ((StreamHandler) inv.getArgument(5)).onMeta("deepseek-flash");
+            ((StreamHandler) inv.getArgument(6)).onMeta("deepseek-flash");
             return null; // 一个 token 都没有
-        }).when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any());
+        }).when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any(), any());
 
         try (MockedConstruction<SseEmitter> mocked = mockConstruction(SseEmitter.class)) {
             streamService.start("c1", request());

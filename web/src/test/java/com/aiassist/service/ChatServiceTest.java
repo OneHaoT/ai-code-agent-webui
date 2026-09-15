@@ -158,7 +158,7 @@ class ChatServiceTest {
     @Test
     void complete_savesAssistantMessageWithReasoning() {
         PreparedChat p = new PreparedChat("c1", "hi", List.of(),
-                new Message("user", "hi"), List.of(), List.of(), true);
+                new Message("user", "hi"), List.of(), List.of(), true, null);
 
         chatService.complete(p, "答案正文", "思维链内容", null);
 
@@ -172,7 +172,7 @@ class ChatServiceTest {
     @Test
     void complete_blankReasoning_notPersisted() {
         PreparedChat p = new PreparedChat("c1", "hi", List.of(),
-                new Message("user", "hi"), List.of(), List.of(), false);
+                new Message("user", "hi"), List.of(), List.of(), false, null);
 
         chatService.complete(p, "答案", "   ", null);
 
@@ -184,7 +184,7 @@ class ChatServiceTest {
     @Test
     void complete_toolTrace_setOnMessageAndSerializes() throws Exception {
         PreparedChat p = new PreparedChat("c1", "hi", List.of(),
-                new Message("user", "hi"), List.of(), List.of(), false);
+                new Message("user", "hi"), List.of(), List.of(), false, null);
         ObjectMapper mapper = new ObjectMapper();
         JsonNode args = mapper.createObjectNode().put("path", "a.txt");
         ToolStep step = ToolStep.started(1, "t1", "read_file", args, null)
@@ -210,7 +210,7 @@ class ChatServiceTest {
     @Test
     void complete_nullOrEmptyTrace_jsonOmitsToolTraceField() throws Exception {
         PreparedChat p = new PreparedChat("c1", "hi", List.of(),
-                new Message("user", "hi"), List.of(), List.of(), false);
+                new Message("user", "hi"), List.of(), List.of(), false, null);
         ObjectMapper out = new ObjectMapper().findAndRegisterModules();
 
         chatService.complete(p, "答案", null, null);
@@ -241,7 +241,7 @@ class ChatServiceTest {
     void rollback_removesMessageAndDeletesRefs_storageFailureSwallowed() {
         ImageRef ref = ref("to-delete");
         PreparedChat p = new PreparedChat("c1", "hi", List.of(ref),
-                new Message("user", "hi", List.of(ref)), List.of(), List.of(), false);
+                new Message("user", "hi", List.of(ref)), List.of(), List.of(), false, null);
         doThrow(new RuntimeException("磁盘只读")).when(storage).delete("to-delete");
 
         assertThatCode(() -> chatService.rollback(p)).doesNotThrowAnyException();
@@ -252,17 +252,17 @@ class ChatServiceTest {
 
     @Test
     void rename_invalidTitles_rejected() {
-        assertThatThrownBy(() -> chatService.renameConversation("c1", "  "))
+        assertThatThrownBy(() -> chatService.updateConversation("c1", "  ", null))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> chatService.renameConversation("c1", "x".repeat(51)))
+        assertThatThrownBy(() -> chatService.updateConversation("c1", "x".repeat(51), null))
                 .isInstanceOf(IllegalArgumentException.class);
-        verify(store, never()).rename(anyString(), anyString());
+        verify(store, never()).update(anyString(), any(), any());
     }
 
     @Test
     void rename_missingConversation_is404Semantic() {
-        when(store.rename(eq("ghost"), anyString())).thenReturn(null);
-        assertThatThrownBy(() -> chatService.renameConversation("ghost", "新标题"))
+        when(store.update(eq("ghost"), any(), any())).thenReturn(null);
+        assertThatThrownBy(() -> chatService.updateConversation("ghost", "新标题", null))
                 .isInstanceOf(ResourceNotFoundException.class);
     }
 
