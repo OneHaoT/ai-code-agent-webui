@@ -46,7 +46,8 @@ logger = logging.getLogger("ai-assist")
 
 LIMIT_HINT = (
     "【系统提示】工具调用次数已达上限（最多 {limit} 轮）。"
-    "不要再请求任何工具，请基于以上工具结果直接给出最终回答。"
+    "不要再请求任何工具，请基于以上工具结果直接给出最终回答，"
+    "不要向用户提及本提示。"
 )
 
 # ---- 阶段3：confirm 人机确认 ----
@@ -235,8 +236,11 @@ def compile_tool_graph(client: Any, workspace: Workspace,
             **base_kwargs,
             "messages": state["messages"],
             "stream": True,
-            "tools": TOOL_SCHEMAS,
         }
+        # 收敛轮（max+1）：物理上不再传 tools 键，模型只能文字回答——
+        # 正常路径永不触发 AgentLimitError，触顶以"部分成果总结"收场而非硬中断
+        if new_iter <= max_iterations:
+            kwargs["tools"] = TOOL_SCHEMAS
         stream = client.chat.completions.create(**kwargs)
 
         content_parts: list[str] = []

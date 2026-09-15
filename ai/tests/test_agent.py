@@ -264,6 +264,8 @@ def test_iteration_limit_gives_final_chance_and_converges(ws):
     # 第三轮请求里提示消息紧贴在最前（tool 结果之后）
     third_msgs = client.chat.completions.create_calls[2]["messages"]
     assert third_msgs[-1]["content"].startswith("【系统提示】")
+    # 收敛轮物理上不传 tools：模型只能文字回答，永不硬中断
+    assert "tools" not in client.chat.completions.create_calls[2]
 
 
 def test_iteration_limit_still_calling_fails_without_orphan_call(ws):
@@ -279,6 +281,8 @@ def test_iteration_limit_still_calling_fails_without_orphan_call(ws):
     assert [c["id"] for c in by_type(events, "tool_call")] == ["t1"]
     assert [r["id"] for r in by_type(events, "tool_result")] == ["t1"]
     assert len(client.chat.completions.create_calls) == 2
+    # 收敛轮请求物理上不带 tools（兜底仅防御异常 API 行为）
+    assert "tools" not in client.chat.completions.create_calls[1]
     # 失败后没有 _final_state
     assert not by_type(events, "_final_state")
 
