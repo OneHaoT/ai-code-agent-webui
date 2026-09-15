@@ -1,5 +1,7 @@
 """
 阶段1只读工具集：read_file / list_dir / glob / grep。
+阶段2新增：search_code（语义检索，只读）。
+阶段3新增：write_file / run_command（本地受限沙箱，写/执行，confirm 前置）。
 
 统一契约
 --------
@@ -7,13 +9,16 @@
    一律返回 ``ToolOutput(status="error")`` 的中文说明，绝不向编排层抛异常；
 2. 输出都有硬上限（行数 / 字节 / 条数 / 耗时），截断置 ``truncated=True``；
    单工具执行由独立线程池 + TOOL_TIMEOUT_SECONDS 硬超时兜底（NFR-2）；
-3. 仅做读操作与目录列举，不产生任何文件系统写入；
+3. 四件套 + search_code 严格只读；write_file / run_command 是仅有的写/执行
+   工具，走 sandbox.LocalSandboxProvider（防 AI 误操作级，见 sandbox.py 威胁
+   模型声明），且在 agent 层必经 confirm 人机确认后才执行；
 4. 目录遍历对每个子目录/文件做沙箱复检，指向根外的符号链接与 Windows
    junction 一律剪枝/跳过（NFR-1，不依赖 os.walk 的 followlinks 语义）。
 
 上限可用环境变量覆盖（均有默认值，不配置也能运行）：
 TOOL_MAX_LINES=2000  TOOL_MAX_BYTES=131072  TOOL_LIST_LIMIT=500
 TOOL_GLOB_LIMIT=200  TOOL_GREP_LIMIT=100    TOOL_TIMEOUT_SECONDS=10
+写/执行配置见 sandbox.py 模块头（SANDBOX_ENABLED/EXEC_*/WRITE_MAX_BYTES）。
 """
 from __future__ import annotations
 
@@ -27,6 +32,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from pathlib import Path
+
+import sandbox as _sandbox
+from sandbox import SandboxError
 
 from workspace import DEFAULT_IGNORE_DIRS, Workspace, WorkspaceViolation
 
@@ -712,6 +720,64 @@ def search_code(ws: Workspace, query: str, path: str = ".") -> ToolOutput:
                       output=output)
 
 
+# ---------------- write_file / run_command（阶段3：本地受限沙箱） ----------------
+#
+# 威胁模型见 sandbox.py 模块头（防 AI 误操作，非防恶意逃逸）；
+# agent 层在调用这两个工具前必须先走 confirm 人机确认（CONFIRM_TOOLS 集合）。
+# 本层只做：provider 调用 + SandboxError 收敛 + 输出格式化；硬边界在 provider。
+
+# 需要 confirm 人机确认的工具名（agent.py 按此判定，只读工具不在其中）
+CONFIRM_TOOLS = frozenset({"write_file", "run_command"})
+
+# SANDBOX_ENABLED=false 时为 None：工具不进 TOOL_SCHEMAS/_DISPATCH，
+# 模型请求它们时 execute_tool 走"未知工具"降级（不杀流）；
+# provider 配置非法（docker 未实现 / 未知值）在此装配期抛 SandboxConfigError，启动即报错
+_SANDBOX = None
+# per-tool 执行池兜底超时覆盖（缺省 TIMEOUT_SECONDS）；run_command 的兜底
+# 须长于沙箱内部 EXEC 超时，给杀树与收尾留时间（tasks Task2 / NFR-2）
+_TOOL_TIMEOUTS: dict[str, float] = {}
+if _sandbox.SANDBOX_ENABLED:
+    _SANDBOX = _sandbox.get_sandbox_provider()
+    _TOOL_TIMEOUTS["run_command"] = _sandbox.EXEC_TIMEOUT_SECONDS + 10.0
+
+
+def write_file(ws: Workspace, path, content) -> ToolOutput:
+    """在工作区内写入/覆盖一个文本文件（confirm 确认后才会被调用）。"""
+    try:
+        r = _SANDBOX.write_file(ws, path, content)
+    except SandboxError as e:
+        return _error("write_file", str(e))
+    verb = "覆盖" if r.overwrite else "新建"
+    return ToolOutput(
+        name="write_file", status="success",
+        output=f"[write_file] 已写入 {r.rel_path}（{r.size} 字节，{verb}）")
+
+
+def run_command(ws: Workspace, command) -> ToolOutput:
+    """在工作区根执行一条白名单命令（confirm 确认后才会被调用）。
+
+    退出码非 0 仍是 success 工具结果：命令失败 ≠ 工具失败，
+    模型需要看到 stderr 自我纠正；超时（provider 杀树后）回 error。
+    """
+    try:
+        r = _SANDBOX.run_command(ws, command)
+    except SandboxError as e:
+        return _error("run_command", str(e))
+    if r.timed_out:
+        output = (f"命令执行超时（>{_sandbox.EXEC_TIMEOUT_SECONDS:.0f}s），"
+                  "已终止整棵进程树")
+        if r.output:
+            output += f"\n已捕获输出：\n{r.output}"
+        return _error("run_command", output)
+    output = f"[run_command] $ {command}\n（退出码 {r.exit_code}）"
+    if r.output:
+        output += "\n" + r.output
+    if r.truncated:
+        output += "\n…（输出超限截断）"
+    return ToolOutput(name="run_command", status="success",
+                      output=output, truncated=r.truncated)
+
+
 # ---------------- OpenAI 工具声明与分发（供 agent 使用） ----------------
 
 TOOL_SCHEMAS = [
@@ -825,14 +891,72 @@ _DISPATCH = {
 if RAG_ENABLED:
     _DISPATCH["search_code"] = search_code
 
+# 阶段3：写/执行工具（SANDBOX_ENABLED=false 时整体不进工具集，照抄 RAG 模式）
+if _sandbox.SANDBOX_ENABLED:
+    TOOL_SCHEMAS = TOOL_SCHEMAS + [
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": (
+                    "在工作区内新建或覆盖一个文本文件（UTF-8）。"
+                    "写入前会向用户发起人工确认，确认后才会真正落盘；"
+                    "内容上限 256KB，路径越出工作区会被拒绝。"
+                    "路径相对于工作区根。"),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string",
+                                 "description": "目标文件相对路径，如 src/demo.py"},
+                        "content": {"type": "string",
+                                    "description": "完整文件内容（UTF-8 文本）"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": (
+                    "在工作区根目录执行一条白名单命令（如 python/pytest/git 等），"
+                    "返回合并的 stdout/stderr 与退出码。执行前会向用户发起人工"
+                    "确认；非白名单命令、黑名单操作会被拒绝，"
+                    "超时（默认 60s）会终止整棵进程树。"),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string",
+                                    "description": "要执行的命令行，如 python main.py"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
+    _DISPATCH["write_file"] = write_file
+    _DISPATCH["run_command"] = run_command
+
+
+def tool_available(name: str) -> bool:
+    """工具是否在当前装配的工具集中。
+
+    SANDBOX_ENABLED=false 时 write_file/run_command 返回 False
+    （agent 的 confirm 门控据此跳过确认帧，走"未知工具"降级）。
+    """
+    return name in _DISPATCH
+
 
 def execute_tool(ws: Workspace, name: str, args) -> ToolOutput:
     """编排层统一入口：任何异常都收敛为 error 工具结果，不允许杀整轮流。
 
-    所有工具在隔离线程池中执行并施加 TOOL_TIMEOUT_SECONDS 硬超时：
-    灾难性正则回溯 / 网络盘 IO 挂起等无法在工具内部自检的场景，由
-    future.result(timeout) 统一兜底，保证请求线程以确定的 error 结果终结。
-    Python 不能安全强杀线程：超时后仅放弃等待，worker 自然结束后回池。
+    所有工具在隔离线程池中执行并施加硬超时兜底：默认 TOOL_TIMEOUT_SECONDS，
+    个别工具经 _TOOL_TIMEOUTS 覆盖（run_command = EXEC_TIMEOUT_SECONDS+10，
+    须长于沙箱内部杀树超时）。灾难性正则回溯 / 网络盘 IO 挂起等无法在工具
+    内部自检的场景，由 future.result(timeout) 统一兜底，保证请求线程以
+    确定的 error 结果终结。Python 不能安全强杀线程：超时后仅放弃等待，
+    worker 自然结束后回池。
     """
     fn = _DISPATCH.get(name)
     if fn is None:
@@ -841,15 +965,21 @@ def execute_tool(ws: Workspace, name: str, args) -> ToolOutput:
         args = {}
     if not isinstance(args, dict):
         return _error(name, "工具参数必须是 JSON 对象")
+    timeout_s = _TOOL_TIMEOUTS.get(name, TIMEOUT_SECONDS)
     future = _TOOL_EXECUTOR.submit(fn, ws, **args)
     try:
-        return future.result(timeout=TIMEOUT_SECONDS)
+        return future.result(timeout=timeout_s)
     except FuturesTimeout:
         future.cancel()
+        if timeout_s == TIMEOUT_SECONDS:
+            return _error(
+                name,
+                f"工具执行超时（>{TIMEOUT_SECONDS:.0f}s），已终止等待；"
+                "请缩小 path 范围或简化正则后重试")
         return _error(
             name,
-            f"工具执行超时（>{TIMEOUT_SECONDS:.0f}s），已终止等待；"
-            "请缩小 path 范围或简化正则后重试")
+            f"工具执行超时（>{timeout_s:.0f}s），已终止等待；"
+            "请缩短命令执行时间后重试")
     except TypeError as e:
         return _error(name, f"工具参数不合法：{e}")
     except Exception as e:  # noqa: BLE001 —— 工具层最后的收敛防线

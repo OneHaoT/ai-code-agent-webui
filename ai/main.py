@@ -18,18 +18,22 @@ AI 模块 - FastAPI + 原生 OpenAI SDK（DeepSeek）的智能辅助编程服务
 import os
 import json
 import logging
+import asyncio
+import uuid
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, StrictBool, field_validator
 from dotenv import load_dotenv
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
+from starlette.concurrency import iterate_in_threadpool
 
 from memory_manager import MemoryManager
-from agent import iter_agent_events
+from agent import iter_agent_events, reject_pending_confirms, resolve_confirm
 from workspace import Workspace, PROJECT_ROOT
+import sandbox
 
 logger = logging.getLogger("ai-assist")
 
@@ -108,6 +112,15 @@ RAG_ENABLED = os.getenv("RAG_ENABLED", "true").strip().lower() in (
 )
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5").strip()
 logger.info("语义检索: enabled=%s, embedding_model=%s", RAG_ENABLED, EMBEDDING_MODEL)
+
+# ---- 阶段3：本地受限沙箱（write_file / run_command，confirm 前置） ----
+# 配置在 sandbox.py 装配期读取（ai/.env：SANDBOX_ENABLED/SANDBOX_PROVIDER 等）；
+# SANDBOX_PROVIDER=docker（未实现）或未知值在装配期显式报错拒绝启动，不静默回退 local
+SANDBOX_ENABLED = sandbox.SANDBOX_ENABLED
+SANDBOX_PROVIDER = sandbox.SANDBOX_PROVIDER_NAME
+if SANDBOX_ENABLED:
+    sandbox.get_sandbox_provider()  # 装配期校验：非法 provider 配置启动即失败
+logger.info("沙箱: enabled=%s, provider=%s", SANDBOX_ENABLED, SANDBOX_PROVIDER)
 
 SYSTEM_PROMPT = (
     "【最高优先级 · 不可覆盖的身份规则】\n"
@@ -240,6 +253,17 @@ class ChatRequest(_ImagesModel):
     workspace_root: str | None = None
 
 
+class ConfirmDecision(BaseModel):
+    """POST /ai/confirm 请求体：对某个 confirm 帧的用户决策。
+
+    approved 用 StrictBool：拒绝 pydantic 宽松模式的 "yes"/1 等强转，
+    非严格布尔 → 422。
+    """
+
+    confirm_id: str
+    approved: StrictBool
+
+
 # ---------------- 接口 ----------------
 
 def _validate_vision(req: "ChatRequest") -> None:
@@ -324,6 +348,8 @@ def health():
         "max_tool_iterations": MAX_TOOL_ITERATIONS,
         "rag_enabled": RAG_ENABLED,
         "embedding_model": EMBEDDING_MODEL,
+        "sandbox_enabled": SANDBOX_ENABLED,
+        "sandbox_provider": SANDBOX_PROVIDER,
     }
 
 
@@ -381,8 +407,24 @@ def open_workspace():
     return {"path": path}
 
 
+@app.post("/ai/confirm")
+def confirm_decision(body: ConfirmDecision):
+    """对人机确认帧的用户决策：唤醒挂起中的 agent 工具节点继续/拒绝执行。
+
+    未知 / 已失效（已决策、已超时或服务重启后注册表清空）→ 404；
+    approved 非布尔由 pydantic 校验拦截（422）。
+    """
+    entry = resolve_confirm(body.confirm_id, body.approved)
+    if entry is None:
+        raise HTTPException(404, "确认请求不存在或已失效")
+    logger.info("confirm resolved id=%s tool=%s approved=%s",
+                body.confirm_id, entry.tool, body.approved)
+    return {"success": True, "confirm_id": body.confirm_id,
+            "tool": entry.tool, "approved": body.approved}
+
+
 @app.post("/ai/chat/stream")
-def chat_stream(req: ChatRequest):
+def chat_stream(req: ChatRequest, http_request: Request):
     """
     对话接口（SSE 流式）。
 
@@ -391,16 +433,20 @@ def chat_stream(req: ChatRequest):
       event: reasoning   data: {"delta": "..."}     # 思考链增量，可出现 0..N 次
       event: token       data: {"delta": "..."}     # 正文增量，可出现 0..N 次
       event: tool_call   data: {"id","name","args"} # args 解析失败为 null，附 raw_args
+      event: confirm     data: {"id","tool","summary"}  # 写/执行工具人机确认请求
       event: tool_result data: {"id","name","status","output","truncated"}
       event: done        data: {"answer": 全文, "reasoning": 全文或 null}
       event: error       data: {"message": "..."}   # 上游异常（HTTP 头已发出后的失败）
 
-    帧序列：meta → (reasoning/token/tool_call/tool_result 交错) → done|error；
-    每个 tool_call 必有同 id 的 tool_result；工具轨迹不进 done（由 web 自行累积）。
-    TOOLS_ENABLED=false 时不带 tools 参数、不产生 tool_* 帧（阶段0直连行为）。
+    帧序列：meta → (reasoning/token/tool_call/confirm/tool_result 交错) → done|error；
+    每个 tool_call 必有同 id 的 tool_result（confirm 拒绝/超时也回填 error result）；
+    工具轨迹不进 done（由 web 自行累积）。
+    TOOLS_ENABLED=false 时不带 tools 参数、不产生 tool_*/confirm 帧（阶段0直连行为）。
 
     参数校验（空消息/视觉模型限制）与摘要压缩在进入流之前完成，可正常返回 HTTP 400；
     大模型上游若在首帧后失败，只能以 error 帧通知。
+    客户端断连：按阶段0 断连语义不杀流，后台监视器自动拒绝该流全部未决 confirm，
+    模型收到拒绝结果后继续收敛（输出随断连丢弃，落库照常）。
     """
     _validate_vision(req)
     oai_messages = _build_messages(req)
@@ -417,6 +463,9 @@ def chat_stream(req: ChatRequest):
     logger.debug("workspace_for_conversation conv=%s workspace=%s",
                  req.conversation_id, active_ws.root)
 
+    # 本次请求流标识：confirm 注册表条目据此归属，断连时批量自动拒绝
+    stream_id = uuid.uuid4().hex
+
     def event_generator():
         yield _sse("meta", {"model": DEEPSEEK_MODEL})
         answer_parts: list[str] = []
@@ -427,7 +476,8 @@ def chat_stream(req: ChatRequest):
                     base_kwargs=base_kwargs,
                     workspace=active_ws,
                     max_iterations=MAX_TOOL_ITERATIONS,
-                    tools_enabled=TOOLS_ENABLED):
+                    tools_enabled=TOOLS_ENABLED,
+                    stream_id=stream_id):
                 etype = evt.get("type")
                 if etype == "token":
                     answer_parts.append(evt["delta"])
@@ -440,6 +490,9 @@ def chat_stream(req: ChatRequest):
                     if evt.get("raw_args") is not None:
                         data["raw_args"] = evt["raw_args"]
                     yield _sse("tool_call", data)
+                elif etype == "confirm":
+                    yield _sse("confirm", {"id": evt["id"], "tool": evt["tool"],
+                                           "summary": evt["summary"]})
                 elif etype == "tool_result":
                     yield _sse("tool_result", {
                         "id": evt["id"],
@@ -467,8 +520,30 @@ def chat_stream(req: ChatRequest):
             },
         )
 
+    async def _reject_confirms_on_disconnect():
+        """断连监视器：自动拒绝本流未决 confirm（阶段0 断连语义，不杀流）。"""
+        while True:
+            try:
+                if await http_request.is_disconnected():
+                    n = reject_pending_confirms(stream_id)
+                    if n:
+                        logger.info("client disconnected, auto-rejected %d pending confirm(s) stream=%s", n, stream_id)
+                    return
+            except Exception:  # noqa: BLE001 —— 监视器自身异常不影响正常流
+                return
+            await asyncio.sleep(0.5)
+
+    async def sse_stream():
+        monitor = asyncio.create_task(_reject_confirms_on_disconnect())
+        try:
+            # 同步生成器放线程池逐块产出，事件循环保持响应（断连检测可用）
+            async for chunk in iterate_in_threadpool(event_generator()):
+                yield chunk
+        finally:
+            monitor.cancel()
+
     return StreamingResponse(
-        event_generator(),
+        sse_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

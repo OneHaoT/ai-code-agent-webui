@@ -96,6 +96,42 @@ class AiClientTest {
     }
 
     @Test
+    void confirmFrame_dispatchedInOrderBetweenToolFrames() throws Exception {
+        String sse = """
+                event: tool_call
+                data: {"id":"t1","name":"write_file","args":{"path":"a.txt"}}
+
+                event: confirm
+                data: {"id":"cf1","tool":"write_file","summary":"写入 a.txt（新建）"}
+
+                event: tool_result
+                data: {"id":"t1","name":"write_file","status":"success","output":"[write_file] 已写入 a.txt（3 字节，新建）","truncated":false}
+
+                event: done
+                data: {"answer":"ok"}
+                """;
+        parse(sse);
+
+        InOrder ordered = inOrder(handler);
+        ordered.verify(handler).onToolCall(
+                eq("t1"), eq("write_file"),
+                argThat((JsonNode n) -> "a.txt".equals(n.path("path").asText())),
+                isNull());
+        ordered.verify(handler).onConfirm("cf1", "write_file", "写入 a.txt（新建）");
+        ordered.verify(handler).onToolResult(
+                "t1", "write_file", "success",
+                "[write_file] 已写入 a.txt（3 字节，新建）", false);
+        // done 帧不产生回调
+        verifyNoMoreInteractions(handler);
+    }
+
+    @Test
+    void confirmFrame_missingFields_safeDefaults() throws Exception {
+        parse("event: confirm\ndata: {\"id\":\"cf2\"}\n\n");
+        verify(handler).onConfirm("cf2", "", "");
+    }
+
+    @Test
     void toolResult_missingStatus_defaultsToError() throws Exception {
         parse("event: tool_result\ndata: {\"id\":\"t4\"}\n\n");
         verify(handler).onToolResult(eq("t4"), eq(""), eq("error"), eq(""), eq(false));

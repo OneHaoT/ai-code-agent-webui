@@ -328,6 +328,20 @@ async function sendMessage(payload) {
           step.durationMs = Math.max(0, Math.round(performance.now() - startedAt))
           toolStartTimes.delete(result.id)
         }
+        // 同名工具已回填结果：确认卡使命完成（确认→已执行 / 拒绝→已回填 error），收起
+        if (assistant.confirmRequest && assistant.confirmRequest.tool === result.name) {
+          assistant.confirmRequest = null
+        }
+      },
+      onConfirm(call) {
+        // 阶段3：写/执行工具确认请求，挂在当前流式消息上展示确认卡
+        if (!assistant) return
+        assistant.confirmRequest = {
+          id: call.id,
+          tool: call.tool,
+          summary: call.summary,
+          state: 'pending'
+        }
       },
       onDone(payload) {
         // 用落库后的完整消息（含 id/createdAt/最终全文/服务端 toolTrace）校正本地累积
@@ -336,6 +350,8 @@ async function sendMessage(payload) {
         } else {
           assistant.streaming = false
         }
+        // 确认状态不落库：done 后无论卡片处于何种状态一律收起
+        assistant.confirmRequest = null
         // 消息已确认落库，本地图片预览可以安全释放
         localUrls.forEach((u) => URL.revokeObjectURL(u))
       },
@@ -394,6 +410,27 @@ async function sendMessage(payload) {
 /** 停止生成：中断前端 SSE 读取（后端仍会跑完并落库，token 照常计费） */
 function stopGeneration() {
   abortController?.abort()
+}
+
+/**
+ * confirm 帧用户决策（阶段3 写/执行工具人机确认）：
+ * POST 决策 → 卡片转终态；404（confirmId 失效：超时/断连/AI 重启）→ expired + toast；
+ * 其他失败保持 pending 允许重试。busy 守卫已覆盖等待确认期间禁发新消息。
+ */
+async function decideConfirm(message, approved) {
+  const req = message?.confirmRequest
+  if (!req || req.state !== 'pending') return
+  try {
+    await api.sendConfirm(currentId.value, req.id, approved)
+    req.state = approved ? 'approved' : 'rejected'
+  } catch (e) {
+    if (e.status === 404) {
+      req.state = 'expired'
+      toast.error('确认请求已失效，该操作已被拒绝')
+    } else {
+      toast.error('确认决策发送失败：' + e.message)
+    }
+  }
 }
 
 /** 切换侧边栏折叠状态（持久化到 localStorage） */
@@ -491,6 +528,7 @@ async function retrySend(failedMsg) {
       @send="sendMessage"
       @stop="stopGeneration"
       @retry="retrySend"
+      @confirm-decide="decideConfirm"
       @new="createConversation"
     />
     <WorkspacePanel

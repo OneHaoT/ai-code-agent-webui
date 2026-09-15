@@ -28,6 +28,14 @@ const TOOL_META = {
   search_code: {
     label: '语义检索',
     icon: 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M21 21l-4.35-4.35 M8.3 11h5.4 M11 8.3v5.4'
+  },
+  write_file: {
+    label: '写入文件',
+    icon: 'M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z'
+  },
+  run_command: {
+    label: '执行命令',
+    icon: 'M4 17l6-6-6-6 M12 19h8'
   }
 }
 const FALLBACK_META = { label: '工具调用', icon: 'M12 2v4 M12 18v4 M2 12h4 M18 12h4' }
@@ -43,6 +51,14 @@ function argSummary(step) {
     return step.rawArgs ? '参数无法解析' : ''
   }
   const parts = []
+  // 阶段3 写工具：路径是关键定位信息；内容在确认卡中预览，这里只显示路径
+  if (step.name === 'write_file') {
+    return a.path != null && a.path !== '' ? String(a.path) : ''
+  }
+  // 阶段3 执行工具：命令全文即摘要（超长由 CSS 截断，title 可见全文）
+  if (step.name === 'run_command') {
+    return a.command != null && a.command !== '' ? String(a.command) : ''
+  }
   // 语义检索：query 是关键信息全量展示，path 仅辅助定位、超长截断
   if (step.name === 'search_code') {
     if (a.query != null && a.query !== '') parts.push(String(a.query))

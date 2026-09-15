@@ -1,5 +1,6 @@
 """
 阶段1：LangGraph 只读工具调用循环。
+阶段3：写/执行工具的 confirm 人机确认（挂起等待用户决策后再执行）。
 
 图结构
 ------
@@ -12,23 +13,34 @@
    langchain-openai 1.x 会剥离 DeepSeek 的 reasoning_content 厂商扩展，
    因此消息全程保持 OpenAI dict 形态，不转 LangChain 消息对象；
 2. 节点通过 LangGraph 的 custom stream writer 产出事件，iter_agent_events()
-   把它们转为统一事件流：token / reasoning / tool_call / tool_result /
-   fatal_error（_ 前缀事件为内部事件，不映射 SSE，如 _final_state）；
+   把它们转为统一事件流：token / reasoning / tool_call / confirm /
+   tool_result / fatal_error（_ 前缀事件为内部事件，不映射 SSE，
+   如 _final_state）；
 3. 支持单轮并行多个 tool_calls（按 id 回填）；循环上限 max_iterations：
    达到上限的那一轮工具照执行并注入“直接作答”提示，给模型一次收敛机会；
-   若提示轮仍请求工具，抛 AgentLimitError，由 main 转 error 帧。
+   若提示轮仍请求工具，抛 AgentLimitError，由 main 转 error 帧；
+4. confirm 人机确认（阶段3）：write_file / run_command（tools.CONFIRM_TOOLS）
+   在 tool_call 帧之后、执行之前发 confirm 帧 {id, tool, summary} 并挂起等待
+   用户决策（POST /ai/confirm 唤醒）；确认→执行，拒绝/超时→回填 error
+   tool_result，磁盘零副作用。配对契约不变：每个 tool_call 必有同 id
+   tool_result（拒绝/超时也回填）；只读工具零 confirm。
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 import uuid
+from dataclasses import dataclass, field
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import START, END, StateGraph
 from langgraph.config import get_stream_writer
 
-from tools import TOOL_SCHEMAS, Workspace, execute_tool
+from tools import (CONFIRM_TOOLS, TOOL_SCHEMAS, Workspace, execute_tool,
+                   tool_available)
+from workspace import Workspace, WorkspaceViolation
 
 logger = logging.getLogger("ai-assist")
 
@@ -37,9 +49,104 @@ LIMIT_HINT = (
     "不要再请求任何工具，请基于以上工具结果直接给出最终回答。"
 )
 
+# ---- 阶段3：confirm 人机确认 ----
+# 挂起等待用户决策的最长时间（超时自动拒绝，防确认帧泄漏挂死流）
+try:
+    CONFIRM_TIMEOUT_SECONDS = max(1.0, float(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120")))
+except ValueError:
+    logger.warning("CONFIRM_TIMEOUT_SECONDS 非法，回退 120")
+    CONFIRM_TIMEOUT_SECONDS = 120.0
+# write_file 确认摘要中的内容预览行数
+_CONFIRM_PREVIEW_LINES = 10
+
 
 class AgentLimitError(Exception):
     """工具循环超过上限且模型在收敛轮仍继续请求工具。"""
+
+
+@dataclass
+class ConfirmEntry:
+    """一次待确认的写/执行请求（进程内存注册表条目）。
+
+    approved: None=未决；True/False=已决策。event 在决策后被置位唤醒等待方。
+    """
+
+    id: str
+    tool: str
+    summary: str
+    stream_id: str | None
+    approved: bool | None = None
+    event: threading.Event = field(default_factory=threading.Event)
+
+
+_CONFIRM_REGISTRY: dict[str, ConfirmEntry] = {}
+_CONFIRM_LOCK = threading.Lock()
+
+
+def create_confirm(tool: str, summary: str,
+                   stream_id: str | None) -> ConfirmEntry:
+    """注册一个待确认请求（confirm_id 全局唯一 uuid4）。"""
+    entry = ConfirmEntry(id=uuid.uuid4().hex, tool=tool, summary=summary,
+                         stream_id=stream_id)
+    with _CONFIRM_LOCK:
+        _CONFIRM_REGISTRY[entry.id] = entry
+    return entry
+
+
+def resolve_confirm(confirm_id: str, approved: bool) -> ConfirmEntry | None:
+    """POST /ai/confirm 的决策入口：置结果并唤醒。
+
+    未知 / 已失效（已决策或已超时清表）→ None（上层转 404）；
+    决策即从注册表移除，二次 POST 同一 id 返回 404。
+    """
+    with _CONFIRM_LOCK:
+        entry = _CONFIRM_REGISTRY.get(confirm_id)
+        if entry is None or entry.approved is not None:
+            return None
+        entry.approved = approved
+        del _CONFIRM_REGISTRY[confirm_id]
+    entry.event.set()
+    return entry
+
+
+def reject_pending_confirms(stream_id: str | None) -> int:
+    """客户端断连：自动拒绝该流的所有未决确认（阶段0 断连语义：断连不杀流）。
+
+    返回拒绝条数；AI 重启时注册表随进程清空，挂起流一并终止。
+    """
+    with _CONFIRM_LOCK:
+        pending = [e for e in _CONFIRM_REGISTRY.values()
+                   if e.stream_id == stream_id and e.approved is None]
+        for e in pending:
+            e.approved = False
+            del _CONFIRM_REGISTRY[e.id]
+    for e in pending:
+        e.event.set()
+    return len(pending)
+
+
+def _confirm_summary(name: str, args: Any, ws: Workspace) -> str:
+    """生成给用户看的确认摘要（write_file：新建/覆盖+路径+内容预览；run_command：命令全文）。"""
+    if not isinstance(args, dict):
+        return f"调用 {name}（参数异常，执行时将被拒绝）"
+    if name == "write_file":
+        path = args.get("path")
+        content = args.get("content")
+        rel = path if isinstance(path, str) and path.strip() else str(path)
+        try:
+            overwrite = (isinstance(path, str) and bool(path.strip())
+                         and ws.resolve(path).is_file())
+        except WorkspaceViolation:
+            return f"写入文件 {rel}（路径越出工作区边界，执行时将被拒绝）"
+        lines = content.splitlines() if isinstance(content, str) else []
+        preview = "\n".join(lines[:_CONFIRM_PREVIEW_LINES]) or "（空内容）"
+        more = (f"\n…（共 {len(lines)} 行，确认后完整写入）"
+                if len(lines) > _CONFIRM_PREVIEW_LINES else "")
+        return (f"{'覆盖' if overwrite else '新建'}文件 {rel}"
+                f"（共 {len(lines)} 行），内容预览：\n{preview}{more}")
+    if name == "run_command":
+        return f"在工作区根执行命令：{args.get('command')}"
+    return f"调用 {name}"
 
 
 def _append_messages(left: list[dict] | None, right: list[dict] | None) -> list[dict]:
@@ -108,8 +215,13 @@ class ToolCallAccumulator:
 
 
 def compile_tool_graph(client: Any, workspace: Workspace,
-                       max_iterations: int, base_kwargs: dict):
-    """构造工具循环图（client 可注入，便于单测用 Fake 客户端驱动）。"""
+                       max_iterations: int, base_kwargs: dict,
+                       stream_id: str | None = None):
+    """构造工具循环图（client 可注入，便于单测用 Fake 客户端驱动）。
+
+    stream_id：本次请求流标识，confirm 注册表条目据此归属，
+    供客户端断连时 reject_pending_confirms(stream_id) 批量拒绝。
+    """
 
     def call_model(state: AgentState) -> dict:
         writer = get_stream_writer()
@@ -180,11 +292,33 @@ def compile_tool_graph(client: Any, workspace: Workspace,
                 writer({"type": "tool_result", "id": call_id, "name": name,
                         "status": "error", "output": content, "truncated": False})
             else:
-                result = execute_tool(workspace, name, args)
-                writer({"type": "tool_result", "id": call_id, "name": name,
-                        "status": result.status, "output": result.output,
-                        "truncated": result.truncated})
-                content = result.output
+                # ---- 阶段3：写/执行工具 confirm 人机确认 ----
+                # 门控 = CONFIRM_TOOLS 且工具在当前装配工具集中：
+                # SANDBOX_ENABLED=false 时写工具不可用，走"未知工具"降级，无 confirm
+                entry: ConfirmEntry | None = None
+                if name in CONFIRM_TOOLS and tool_available(name):
+                    summary = _confirm_summary(name, args, workspace)
+                    entry = create_confirm(name, summary, stream_id)
+                    writer({"type": "confirm", "id": entry.id,
+                            "tool": name, "summary": summary})
+                    entry.event.wait(CONFIRM_TIMEOUT_SECONDS)
+                    with _CONFIRM_LOCK:
+                        _CONFIRM_REGISTRY.pop(entry.id, None)  # 超时路径清表
+                if entry is not None and entry.approved is not True:
+                    # 拒绝 / 超时：磁盘零执行，回填 error（配对契约：必有同 id result）
+                    reason = ("用户拒绝了本次执行" if entry.approved is False
+                              else f"确认等待超时（{CONFIRM_TIMEOUT_SECONDS:.0f}s），已自动拒绝")
+                    content = (f"[{name}] 未执行：{reason}。"
+                               "请尊重用户决定，不要重复请求同一操作。")
+                    writer({"type": "tool_result", "id": call_id, "name": name,
+                            "status": "error", "output": content,
+                            "truncated": False})
+                else:
+                    result = execute_tool(workspace, name, args)
+                    writer({"type": "tool_result", "id": call_id, "name": name,
+                            "status": result.status, "output": result.output,
+                            "truncated": result.truncated})
+                    content = result.output
             follow_up.append(
                 {"role": "tool", "tool_call_id": call_id, "content": content})
 
@@ -233,12 +367,14 @@ def _iter_plain_stream(client, messages: list[dict], base_kwargs: dict):
 
 def iter_agent_events(client, messages: list[dict], *,
                       base_kwargs: dict, workspace: Workspace,
-                      max_iterations: int, tools_enabled: bool):
+                      max_iterations: int, tools_enabled: bool,
+                      stream_id: str | None = None):
     """统一事件流生成器。
 
     事件：
       {"type":"token","delta"} / {"type":"reasoning","delta"}
       {"type":"tool_call","id","name","args"[,"raw_args"]}
+      {"type":"confirm","id","tool","summary"}   # 写/执行工具的人机确认请求
       {"type":"tool_result","id","name","status","output","truncated"}
       {"type":"fatal_error","message"}
       {"type":"_final_state","messages"}   # 内部事件，不映射 SSE
@@ -247,7 +383,8 @@ def iter_agent_events(client, messages: list[dict], *,
         yield from _iter_plain_stream(client, messages, base_kwargs)
         return
 
-    graph = compile_tool_graph(client, workspace, max_iterations, base_kwargs)
+    graph = compile_tool_graph(client, workspace, max_iterations, base_kwargs,
+                               stream_id=stream_id)
     final_state: dict | None = None
     try:
         # custom：节点 writer 负载；values：每步完整状态（取最后一份做终态）

@@ -244,7 +244,9 @@ def test_schemas_include_search_code_by_default():
     r = _run_py(code, {})
     assert r.returncode == 0, r.stderr
     assert "HAS True" in r.stdout
-    assert "['read_file', 'list_dir', 'glob', 'grep']" in r.stdout
+    # 阶段3起默认装配还含 write_file/run_command（此处只关注 search_code 语义）
+    assert ("['read_file', 'list_dir', 'glob', 'grep', "
+            "'write_file', 'run_command']") in r.stdout
 
 
 def test_schemas_exclude_search_code_when_rag_disabled():

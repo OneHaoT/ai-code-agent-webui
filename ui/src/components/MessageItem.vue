@@ -3,11 +3,12 @@ import { ref, computed, watch, nextTick, onBeforeUnmount } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import ToolStepList from './ToolStepList.vue'
+import ConfirmCard from './ConfirmCard.vue'
 
 const props = defineProps({
   message: { type: Object, required: true }
 })
-const emit = defineEmits(['retry'])
+const emit = defineEmits(['retry', 'confirm-decide'])
 
 const isUser = computed(() => props.message.role === 'user')
 
@@ -203,6 +204,12 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onLightboxKey))
         <ToolStepList
           v-if="!isUser && !message.error && message.toolTrace && message.toolTrace.length"
           :steps="message.toolTrace"
+        />
+        <!-- 阶段3：写/执行工具人机确认卡（confirm 帧驱动，仅流式期间存在，不落库） -->
+        <ConfirmCard
+          v-if="!isUser && !message.error && message.confirmRequest"
+          :request="message.confirmRequest"
+          @decide="(approved) => emit('confirm-decide', message, approved)"
         />
         <div v-if="isUser && message.content" class="markdown" v-html="userText"></div>
         <div v-else-if="!isUser" ref="markdownBody" class="markdown">

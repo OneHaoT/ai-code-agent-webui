@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Map;
 
 import com.aiassist.client.dto.AiHealthResponse;
+import com.aiassist.dto.ConfirmDecisionRequest;
 import com.aiassist.dto.CreateConversationRequest;
 import com.aiassist.dto.RenameConversationRequest;
 import com.aiassist.dto.SendMessageRequest;
@@ -92,6 +93,22 @@ public class ChatController {
     @PostMapping(path = "/conversations/{id}/chat/stream", produces = "text/event-stream;charset=UTF-8")
     public SseEmitter chatStream(@PathVariable String id, @RequestBody SendMessageRequest body) {
         return chatStreamService.start(id, body);
+    }
+
+    /**
+     * 转发用户对 confirm 帧的决策（阶段3 写/执行工具人机确认）。
+     * web 不理解 confirm 语义，仅校验参数后转发 POST /ai/confirm；
+     * confirmId 未知/已失效时 ai 返回 404，此处透传 404。
+     */
+    @PostMapping("/conversations/{id}/confirm")
+    public JsonNode confirm(@PathVariable String id, @RequestBody ConfirmDecisionRequest body) {
+        if (body == null || body.confirmId() == null || body.confirmId().isBlank()) {
+            throw new IllegalArgumentException("confirmId 不能为空");
+        }
+        if (body.approved() == null) {
+            throw new IllegalArgumentException("approved 必须为布尔值");
+        }
+        return aiClient.confirmExecution(body.confirmId(), body.approved());
     }
 
     /** AI 模块健康/配置状态(便于前端提示 key 是否已配置) */

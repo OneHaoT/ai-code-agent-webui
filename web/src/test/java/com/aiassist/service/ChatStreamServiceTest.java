@@ -184,6 +184,62 @@ class ChatStreamServiceTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void start_confirmFrame_forwardedInOrderAndNotAccumulatedInTrace() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        when(chatService.prepare(eq("c1"), any(), any(), eq(false))).thenReturn(prepared());
+        doAnswer(inv -> {
+            StreamHandler handler = inv.getArgument(6);
+            handler.onMeta("deepseek-flash");
+            handler.onToolCall("t1", "write_file",
+                    mapper.readTree("{\"path\":\"a.txt\",\"content\":\"hi\"}"), null);
+            handler.onConfirm("cf1", "write_file", "写入 a.txt（新建）");
+            handler.onToolResult("t1", "write_file", "success",
+                    "[write_file] 已写入 a.txt（2 字节，新建）", false);
+            handler.onToken("完成");
+            return null;
+        }).when(aiClient).streamChat(anyString(), anyString(), any(), any(), anyBoolean(), any(), any());
+        when(chatService.complete(any(), eq("完成"), isNull(), anyList()))
+                .thenReturn(new Message("assistant", "完成"));
+
+        try (MockedConstruction<SseEmitter> mocked = mockConstruction(SseEmitter.class)) {
+            streamService.start("c1", request());
+            SseEmitter mockEmitter = mocked.constructed().get(0);
+
+            // 1) 轨迹不含 confirm：只有配对的 tool_call/tool_result 步骤
+            ArgumentCaptor<List<ToolStep>> traceCap = ArgumentCaptor.forClass(List.class);
+            verify(chatService).complete(any(), eq("完成"), isNull(), traceCap.capture());
+            assertThat(traceCap.getValue()).hasSize(1);
+            assertThat(traceCap.getValue().get(0).id()).isEqualTo("t1");
+
+            // 2) 透传帧：meta + tool_call + confirm + tool_result + token + done = 6，名称有序
+            ArgumentCaptor<SseEmitter.SseEventBuilder> frameCap =
+                    ArgumentCaptor.forClass(SseEmitter.SseEventBuilder.class);
+            verify(mockEmitter, times(6)).send(frameCap.capture());
+            List<String> frameNames = new ArrayList<>();
+            List<Object> framePayloads = new ArrayList<>();
+            for (SseEmitter.SseEventBuilder builder : frameCap.getAllValues()) {
+                for (ResponseBodyEmitter.DataWithMediaType d : builder.build()) {
+                    Object data = d.getData();
+                    if (data instanceof String s && s.startsWith("event:")) {
+                        frameNames.add(s.substring("event:".length(), s.indexOf('\n')));
+                    } else if (!(data instanceof String)) {
+                        framePayloads.add(data);
+                    }
+                }
+            }
+            assertThat(frameNames).containsExactly(
+                    "meta", "tool_call", "confirm", "tool_result", "token", "done");
+
+            // confirm 帧三字段原样透传
+            Map<String, Object> confirmPayload = (Map<String, Object>) framePayloads.get(2);
+            assertThat(confirmPayload).containsEntry("id", "cf1")
+                    .containsEntry("tool", "write_file")
+                    .containsEntry("summary", "写入 a.txt（新建）");
+        }
+    }
+
+    @Test
     void start_aiFailure_rollsBackAndCompletesWithErrorFrame() {
         when(chatService.prepare(eq("c1"), any(), any(), eq(false))).thenReturn(prepared());
         doThrow(new AiServiceException("AI 模块不可用"))

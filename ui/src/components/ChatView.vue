@@ -17,7 +17,7 @@ const props = defineProps({
   // 右侧工作区面板折叠状态
   workspaceCollapsed: { type: Boolean, default: false }
 })
-const emit = defineEmits(['send', 'stop', 'retry', 'new', 'toggle-sidebar', 'toggle-workspace'])
+const emit = defineEmits(['send', 'stop', 'retry', 'confirm-decide', 'new', 'toggle-sidebar', 'toggle-workspace'])
 
 const toast = useToast()
 
@@ -193,6 +193,7 @@ watch(
           :key="m._key ?? m.id ?? i"
           :message="m"
           @retry="emit('retry', $event)"
+          @confirm-decide="(msg, approved) => emit('confirm-decide', msg, approved)"
         />
         <!-- 图片上传阶段：与"AI 思考中"区分，避免用户误以为模型无响应 -->
         <TypingIndicator v-if="uploading" label="正在上传图片…" />

@@ -12,7 +12,9 @@ async function request(path, options = {}) {
       const data = await res.json()
       if (data.error) msg = data.error
     } catch (_) {}
-    throw new Error(msg)
+    const err = new Error(msg)
+    err.status = res.status // 调用方按状态码分流（如 confirm 404 = 已失效）
+    throw err
   }
   return res.json()
 }
@@ -60,6 +62,16 @@ export const api = {
     request('/api/workspace/open', { method: 'POST' }),
 
   /**
+   * 转发用户对 confirm 帧的决策（阶段3 写/执行工具人机确认）。
+   * confirmId 未知/已失效时后端返回 404（err.status === 404）。
+   */
+  sendConfirm: (conversationId, confirmId, approved) =>
+    request(`/api/conversations/${conversationId}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ confirmId, approved })
+    }),
+
+  /**
    * 上传图片（multipart 不能带 JSON Content-Type，浏览器自动设置 boundary）
    * @returns {Promise<{id:string,filename:string,contentType:string,size:number,url:string}>}
    */
@@ -88,6 +100,7 @@ export const api = {
    * 流式发送消息（SSE）。handlers 回调：
    *   onMeta({model}) / onToken(delta) / onReasoning(delta) /
    *   onToolCall({id,name,args,rawArgs}) / onToolResult({id,name,status,output,truncated}) /
+   *   onConfirm({id,tool,summary}) /
    *   onDone({message})
    * 响应头提交前的失败（400/502 等）以普通 reject(Error) 抛出；
    * 流开始后的失败以 onError({message}) 事件返回（服务端会回滚用户消息）。
@@ -173,6 +186,14 @@ export const api = {
             status: payload.status || 'error',
             output: payload.output ?? '',
             truncated: !!payload.truncated
+          })
+          break
+        case 'confirm':
+          // 阶段3：写/执行工具人机确认请求 {id, tool, summary}
+          handlers.onConfirm?.({
+            id: payload.id,
+            tool: payload.tool,
+            summary: payload.summary ?? ''
           })
           break
         case 'done':

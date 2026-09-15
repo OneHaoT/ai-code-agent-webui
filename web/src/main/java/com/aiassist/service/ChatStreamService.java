@@ -134,6 +134,13 @@ public class ChatStreamService {
                         }
 
                         @Override
+                        public void onConfirm(String id, String tool, String summary) {
+                            // 阶段3：确认帧原样透传，不累积轨迹（轨迹以 tool_call/tool_result 为准）
+                            sendFrame(emitter, clientAlive, "confirm", Map.of(
+                                    "id", id, "tool", tool, "summary", summary));
+                        }
+
+                        @Override
                         public void onToolResult(String id, String name, String status,
                                                  String output, boolean truncated) {
                             Long durationMs = null;

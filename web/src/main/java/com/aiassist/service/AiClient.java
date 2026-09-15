@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 
 import com.aiassist.client.StreamHandler;
 import com.aiassist.client.dto.AiChatRequest;
@@ -13,6 +14,7 @@ import com.aiassist.client.dto.AiHealthResponse;
 import com.aiassist.client.dto.AiHistoryMessage;
 import com.aiassist.config.AiServiceProperties;
 import com.aiassist.exception.AiServiceException;
+import com.aiassist.exception.ResourceNotFoundException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -184,6 +186,13 @@ public class AiClient {
                     handler.onToolCall(node.path("id").asText(""),
                             node.path("name").asText(""), argsNode, rawArgs);
                 }
+                case "confirm" -> {
+                    // 阶段3：写/执行工具人机确认请求，web 只透传不理解语义
+                    JsonNode node = objectMapper.readTree(rawData);
+                    handler.onConfirm(node.path("id").asText(""),
+                            node.path("tool").asText(""),
+                            node.path("summary").asText(""));
+                }
                 case "tool_result" -> {
                     JsonNode node = objectMapper.readTree(rawData);
                     // status 缺失按 error 处理（帧异常时不得伪装成功）
@@ -209,6 +218,35 @@ public class AiClient {
         } catch (IOException e) {
             // data 是合法 JSON（由 AI 模块保证），坏帧直接忽略而非中断整条流
             log.warn("解析 SSE 帧失败 event={}: {}", event, e.getMessage());
+        }
+    }
+
+    /**
+     * 转发用户对 confirm 帧的决策到 AI 模块 POST /ai/confirm。
+     * ai 返回 404（未知/已失效 confirmId）时转抛 ResourceNotFoundException（→ 404 透传），
+     * 其余失败统一 AiServiceException（→ 502）。
+     */
+    public JsonNode confirmExecution(String confirmId, boolean approved) {
+        try {
+            return restClient.post()
+                    .uri("/ai/confirm")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(Map.of("confirm_id", confirmId, "approved", approved))
+                    .accept(MediaType.APPLICATION_JSON)
+                    .retrieve()
+                    .onStatus(status -> status.value() == 404, (req, res) -> {
+                        throw new ResourceNotFoundException("确认请求不存在或已失效");
+                    })
+                    .onStatus(HttpStatusCode::isError, (req, res) -> {
+                        throw new AiServiceException("确认决策转发失败: " + res.getStatusCode());
+                    })
+                    .body(JsonNode.class);
+        } catch (ResourceNotFoundException e) {
+            throw e;
+        } catch (ResourceAccessException e) {
+            throw new AiServiceException("无法连接 AI 模块: " + e.getMessage(), e);
+        } catch (RestClientException e) {
+            throw new AiServiceException("转发确认决策失败: " + e.getMessage(), e);
         }
     }
 

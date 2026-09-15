@@ -509,7 +509,9 @@ def test_execute_tool_hard_timeout(ws, monkeypatch):
 def test_tool_schemas_complete():
     names = {t["function"]["name"] for t in tools.TOOL_SCHEMAS}
     # 阶段2：RAG_ENABLED 默认 true，search_code 自动装配进工具集
-    assert names == {"read_file", "list_dir", "glob", "grep", "search_code"}
+    # 阶段3：SANDBOX_ENABLED 默认 true，write_file/run_command 装配（写/执行，confirm 前置）
+    assert names == {"read_file", "list_dir", "glob", "grep", "search_code",
+                     "write_file", "run_command"}
     required_map = {
         spec["function"]["name"]:
             spec["function"]["parameters"].get("required", [])
