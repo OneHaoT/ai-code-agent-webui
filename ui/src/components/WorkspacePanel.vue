@@ -112,7 +112,20 @@ function confirmTrust() {
 }
 
 // ============ 选择目录按钮 ============
-function triggerSelectDirectory() {
+async function triggerSelectDirectory() {
+  // Chromium：File System Access API 可指定起始目录为"下载"，且无需枚举目录内文件
+  if (window.showDirectoryPicker) {
+    try {
+      const handle = await window.showDirectoryPicker({ startIn: 'downloads' })
+      trustDialog.value.hint = handle.name || 'my-project'
+      trustDialog.value.path = ''
+      trustDialog.value.show = true
+    } catch {
+      // 用户取消选择（AbortError）：静默返回
+    }
+    return
+  }
+  // 退化路径：Firefox/Safari 不支持 showDirectoryPicker，且无法控制起始目录
   dirInput.value?.click()
 }
 
