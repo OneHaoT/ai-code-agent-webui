@@ -69,21 +69,40 @@ def test_slim_keeps_tail_and_replaces_old(monkeypatch=None):
     assert ph["tool_call_id"] == "c1"
 
 
-def test_slim_single_oversized_message_replaced():
-    huge = "q" * 2000
-    msgs = [
-        _assistant_with_calls([("c1", "read_file", '{"path":"huge.txt"}')]),
-        _tool_msg("c1", huge),
-        {"role": "user", "content": "继续"},
-    ]
-    out = agent._slim_messages(msgs, budget=1000)
-    assert "已省略" in out[1]["content"]
-    assert out[2]["content"] == "继续"  # 非 tool 消息不动
-
-
 def test_slim_no_tool_messages_noop():
     msgs = [{"role": "user", "content": "hi"}]
     assert agent._slim_messages(msgs, budget=10) == msgs
+
+
+def test_slim_last_round_exempt_even_oversized():
+    # 最近一轮单条超大输出（如 run_command 64KB 日志）必须全文保留——
+    # 占位会让模型看不到刚跑的命令结果，进而重跑命令或瞎猜
+    huge_out = "L" * 5000
+    msgs = [
+        _assistant_with_calls([("old", "read_file", '{"path":"a.txt"}')]),
+        _tool_msg("old", "x" * 3000),
+        _assistant_with_calls([("cur", "run_command", '{"command":"mvn test"}')]),
+        _tool_msg("cur", huge_out),
+    ]
+    out = agent._slim_messages(msgs, budget=1000)
+    assert out[3]["content"] == huge_out            # 最近轮豁免
+    assert "已省略" in out[1]["content"]             # 旧轮超预算占位
+
+
+def test_slim_last_round_parallel_tools_all_pinned():
+    # 并行调用：最后一轮的多个 tool 结果全部豁免
+    msgs = [
+        _assistant_with_calls([("a1", "read_file", '{"path":"a.txt"}')]),
+        _tool_msg("a1", "x" * 3000),
+        _assistant_with_calls([("p1", "read_file", '{"path":"b.txt"}'),
+                               ("p2", "list_dir", '{"path":"."}')]),
+        _tool_msg("p1", "y" * 4000),
+        _tool_msg("p2", "z" * 4000),
+    ]
+    out = agent._slim_messages(msgs, budget=1000)
+    assert out[3]["content"] == "y" * 4000
+    assert out[4]["content"] == "z" * 4000
+    assert "已省略" in out[1]["content"]
 
 
 def test_slim_placeholder_without_meta_falls_back():
@@ -111,11 +130,13 @@ def test_agent_loop_sends_slimmed_history(ws, monkeypatch):
     tools_msgs = [m for m in third if m["role"] == "tool"]
     assert len(tools_msgs) == 2  # 配对完整：占位仍是合法 tool 消息
     by_id = {m["tool_call_id"]: m for m in tools_msgs}
-    # 旧的 read_file 大输出（60KB > 1KB 预算）→ 占位；新的 list_dir → 全文保留
+    # 旧的 read_file 大输出（60KB > 1KB 预算，非最近轮）→ 占位；
+    # 新的 list_dir（最近轮）→ 全文保留
     assert "已省略" in by_id["t1"]["content"] and "read_file" in by_id["t1"]["content"]
     assert f"原 60027 字符" in by_id["t1"]["content"]
     assert "已省略" not in by_id["t2"]["content"]
-    # 第二轮请求中 t1 同样因单条超预算而占位（read_file 输出 60027 > 预算 1000）
+    # 第二轮请求中 t1 是最近轮 → 轮级豁免全文保留（模型刚读完必须看得到）
     second = client.chat.completions.create_calls[1]["messages"]
     second_t1 = [m for m in second if m.get("tool_call_id") == "t1"][0]
-    assert "已省略" in second_t1["content"]
+    assert "已省略" not in second_t1["content"]
+    assert "[文件] big.txt" in second_t1["content"]  # read_file 输出 header

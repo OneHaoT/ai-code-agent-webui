@@ -244,6 +244,9 @@ def _slim_messages(messages: list[dict], budget: int | None = None) -> list[dict
     - assistant 的 tool_calls 结构与全部非 tool 消息一律不动
       （OpenAI 协议要求每个 tool_call_id 都有对应 tool 消息，占位仍合法）；
     - 预算内（尾部累计 ≤ budget 字符）的 tool 消息保持全文；
+    - 轮级豁免：最后一个 assistant(tool_calls) 的全部 tool 结果**永远全文
+      保留**，即使单条超预算——它们是模型当前决策的直接依据（如刚跑完的
+      命令输出/刚写的文件回执），占位会导致模型重跑命令或瞎猜结果；
     - budget=None 时运行时读 SLIM_BUDGET_CHARS（env 可覆盖，可 monkeypatch）。
     """
     if budget is None:
@@ -255,12 +258,26 @@ def _slim_messages(messages: list[dict], budget: int | None = None) -> list[dict
             preview = (fn.get("arguments") or "").strip()[:120]
             meta[tc.get("id")] = f"{fn.get('name')}({preview})"
 
+    # 定位最后一轮 tool_calls，其全部结果豁免瘦身（含并行调用的多条）
+    last_calls_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") == "assistant" and (m.get("tool_calls") or []):
+            last_calls_idx = i
+            break
+    pinned: set[str] = set()
+    if last_calls_idx is not None:
+        pinned = {tc.get("id")
+                  for tc in (messages[last_calls_idx]["tool_calls"])}
+
     out = list(messages)
     used = 0
     slimmed = 0
     for i in range(len(out) - 1, -1, -1):
         m = out[i]
         if m.get("role") != "tool":
+            continue
+        if m.get("tool_call_id") in pinned:
             continue
         content = m.get("content") or ""
         used += len(content)
