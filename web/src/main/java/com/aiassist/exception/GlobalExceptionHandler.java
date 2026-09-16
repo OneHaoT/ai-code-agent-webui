@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 
 import java.util.concurrent.RejectedExecutionException;
 
@@ -94,6 +95,17 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Map<String, Object>> handleAiService(AiServiceException e) {
         log.error("调用 AI 模块失败: {}", e.getMessage(), e);
         return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(body(false, e.getMessage()));
+    }
+
+    /**
+     * SSE 异步超时/断开：响应头已按 text/event-stream 提交，此刻再写 JSON
+     * 会抛 HttpMessageNotWritableException（二次异常 + 误导性 ERROR 日志）。
+     * 返回 void 标记"请求已处理"，交给容器完成 async dispatch 即可。
+     * AI 侧任务由 clientAlive 标志感知断开，继续跑完并正常落库。
+     */
+    @ExceptionHandler(AsyncRequestTimeoutException.class)
+    public void handleAsyncTimeout(AsyncRequestTimeoutException e) {
+        log.warn("SSE 连接超时或已断开，本次流式响应终止（任务仍在后台继续）");
     }
 
     /** 兜底：其他未预期异常 → 500 */

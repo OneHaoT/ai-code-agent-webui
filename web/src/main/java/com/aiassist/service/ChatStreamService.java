@@ -41,8 +41,13 @@ public class ChatStreamService {
 
     private static final Logger log = LoggerFactory.getLogger(ChatStreamService.class);
 
-    /** SSE 总超时：略大于 AI 模块读取超时（180s），留出收尾时间 */
-    private static final long SSE_TIMEOUT_MS = 300_000L;
+    /**
+     * SSE 总超时：0 = 不设服务器侧超时（Servlet 规范：AsyncContext.setTimeout(0) 禁用）。
+     * 连接生命周期由客户端断开/停止按钮与 AI 任务自然终点（工具循环上限、
+     * EXEC_TIMEOUT、confirm 120s 收敛）管理。工具循环任务总时长常超 5 分钟，
+     * 旧的 300s 上限会在任务正常执行中被 AsyncRequestTimeoutException 掐断。
+     */
+    private static final long SSE_TIMEOUT_MS = 0L;
 
     private final ChatService chatService;
     private final AiClient aiClient;
