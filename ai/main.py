@@ -99,12 +99,12 @@ _LEGACY_WR = os.getenv("WORKSPACE_ROOT", "").strip() or None
 _default_ws_root = _LEGACY_WR or str(DEFAULT_WORKSPACE_DIR)
 workspace = Workspace(_default_ws_root)
 # 单轮对话内工具循环的最大轮数（防无限调用烧钱）。
-# 阶段3 后工具增至 7 个且含写/执行，真实任务 8 轮触顶率过高，默认 24
+# 编码任务读写频繁（读→改→跑→看→再改），轮次天然偏多，默认 32
 try:
-    MAX_TOOL_ITERATIONS = max(1, int(os.getenv("MAX_TOOL_ITERATIONS", "24")))
+    MAX_TOOL_ITERATIONS = max(1, int(os.getenv("MAX_TOOL_ITERATIONS", "32")))
 except ValueError:
-    logger.warning("MAX_TOOL_ITERATIONS 非法，回退 24")
-    MAX_TOOL_ITERATIONS = 24
+    logger.warning("MAX_TOOL_ITERATIONS 非法，回退 32")
+    MAX_TOOL_ITERATIONS = 32
 logger.info("工具调用: enabled=%s, default_workspace=%s, max_iterations=%s",
             TOOLS_ENABLED, workspace.root, MAX_TOOL_ITERATIONS)
 

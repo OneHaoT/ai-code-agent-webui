@@ -112,16 +112,16 @@ def test_read_file_binary_rejected(ws):
     assert "二进制" in out.output
 
 
-def test_read_file_truncated_2000_lines(ws):
-    write(ws.root / "big.txt", "".join(f"line{i}\n" for i in range(1, 2002)))
+def test_read_file_truncated_default_lines(ws):
+    write(ws.root / "big.txt", "".join(f"line{i}\n" for i in range(1, 402)))
     out = tools.read_file(ws, "big.txt")
     assert out.status == "success"
     assert out.truncated is True
-    # 恰好 2000 个带行号的行（行首才是行号，header 里的 " | " 不算）
+    # 恰好 400 个带行号的行（行首才是行号，header 里的 " | " 不算）
     numbered = [ln for ln in out.output.splitlines()
                 if ln.lstrip()[:1].isdigit() and " | " in ln]
-    assert len(numbered) == 2000
-    assert "共 2001 行" in out.output
+    assert len(numbered) == 400
+    assert "共 401 行" in out.output
     assert "offset" in out.output
 
 

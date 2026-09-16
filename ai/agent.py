@@ -18,12 +18,17 @@
    如 _final_state）；
 3. 支持单轮并行多个 tool_calls（按 id 回填）；循环上限 max_iterations：
    达到上限的那一轮工具照执行并注入“直接作答”提示，给模型一次收敛机会；
-   若提示轮仍请求工具，抛 AgentLimitError，由 main 转 error 帧；
+   收敛轮请求物理不带 tools 键（模型只能文字回答，正常路径不再硬中断）；
 4. confirm 人机确认（阶段3）：write_file / run_command（tools.CONFIRM_TOOLS）
    在 tool_call 帧之后、执行之前发 confirm 帧 {id, tool, summary} 并挂起等待
    用户决策（POST /ai/confirm 唤醒）；确认→执行，拒绝/超时→回填 error
    tool_result，磁盘零副作用。配对契约不变：每个 tool_call 必有同 id
    tool_result（拒绝/超时也回填）；只读工具零 confirm。
+5. 历史工具输出瘦身（token 治理）：编程 agent 读写频繁，工具循环每轮都会
+   把此前全部 tool_result 原样重发，token 随轮数 O(n²) 膨胀。call_model
+   发请求前构造瘦副本：从尾部向前保留累计 ≤ TOOL_HISTORY_SLIM_BUDGET 字符
+   的 tool 消息全文，更早的替换为一行占位（模型可重新调用工具获取）；
+   state 权威消息不动（仅影响发往模型的副本）。
 """
 from __future__ import annotations
 
@@ -215,6 +220,62 @@ class ToolCallAccumulator:
         return built
 
 
+# ---------------- 历史工具输出瘦身（token 治理） ----------------
+# 单次工具输出（尤其 read_file）可达数万字符；工具循环每轮都携带全部历史
+# tool_result 重发，token 随轮数 O(n²) 膨胀。发请求前构造瘦副本：
+# 从尾部向前保留累计 ≤ 预算的 tool 消息全文，更早的替换为一行占位。
+# 权威 state["messages"] 不动（落库/摘要依赖完整历史）；副本仅影响本次请求。
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("%s 非法，回退 %s", name, default)
+        return default
+
+
+SLIM_BUDGET_CHARS = _int_env("TOOL_HISTORY_SLIM_BUDGET", 48_000)
+
+
+def _slim_messages(messages: list[dict], budget: int | None = None) -> list[dict]:
+    """返回瘦副本：旧的 tool 消息 content 替换为占位，其余原样（引用共享）。
+
+    - 反查 assistant.tool_calls 得到每个 tool_call_id 的工具名+参数预览，
+      占位文案带上下文便于模型决定是否重新调用；
+    - assistant 的 tool_calls 结构与全部非 tool 消息一律不动
+      （OpenAI 协议要求每个 tool_call_id 都有对应 tool 消息，占位仍合法）；
+    - 预算内（尾部累计 ≤ budget 字符）的 tool 消息保持全文；
+    - budget=None 时运行时读 SLIM_BUDGET_CHARS（env 可覆盖，可 monkeypatch）。
+    """
+    if budget is None:
+        budget = SLIM_BUDGET_CHARS
+    meta: dict[str, str] = {}
+    for m in messages:
+        for tc in (m.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            preview = (fn.get("arguments") or "").strip()[:120]
+            meta[tc.get("id")] = f"{fn.get('name')}({preview})"
+
+    out = list(messages)
+    used = 0
+    slimmed = 0
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if m.get("role") != "tool":
+            continue
+        content = m.get("content") or ""
+        used += len(content)
+        if used <= budget:
+            continue
+        desc = meta.get(m.get("tool_call_id"), "未知工具")
+        out[i] = {**m, "content": (
+            f"[历史工具输出已省略：{desc}，原 {len(content)} 字符。"
+            f"如需该内容请重新调用对应工具获取]")}
+        slimmed += 1
+    if slimmed:
+        logger.debug("历史工具输出瘦身：占位 %d 条（预算 %d 字符）", slimmed, budget)
+    return out
+
+
 def compile_tool_graph(client: Any, workspace: Workspace,
                        max_iterations: int, base_kwargs: dict,
                        stream_id: str | None = None):
@@ -234,7 +295,8 @@ def compile_tool_graph(client: Any, workspace: Workspace,
 
         kwargs = {
             **base_kwargs,
-            "messages": state["messages"],
+            # 瘦副本：历史工具输出超预算部分替换占位，权威 state 不动
+            "messages": _slim_messages(state["messages"]),
             "stream": True,
         }
         # 收敛轮（max+1）：物理上不再传 tools 键，模型只能文字回答——

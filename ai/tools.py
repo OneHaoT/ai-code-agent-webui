@@ -16,7 +16,7 @@
    junction 一律剪枝/跳过（NFR-1，不依赖 os.walk 的 followlinks 语义）。
 
 上限可用环境变量覆盖（均有默认值，不配置也能运行）：
-TOOL_MAX_LINES=2000  TOOL_MAX_BYTES=131072  TOOL_LIST_LIMIT=500
+TOOL_MAX_LINES=400  TOOL_MAX_BYTES=32768  TOOL_LIST_LIMIT=500
 TOOL_GLOB_LIMIT=200  TOOL_GREP_LIMIT=100    TOOL_TIMEOUT_SECONDS=10
 写/执行配置见 sandbox.py 模块头（SANDBOX_ENABLED/EXEC_*/WRITE_MAX_BYTES）。
 """
@@ -54,8 +54,10 @@ def _float_env(key: str, default: float) -> float:
 
 
 # ---- 硬上限（NFR-2：成本与稳定） ----
-MAX_LINES = _int_env("TOOL_MAX_LINES", 2000)
-MAX_BYTES = _int_env("TOOL_MAX_BYTES", 128 * 1024)
+# 编程 agent 读写频繁：单次读取过宽会令每轮请求 token 巨大（历史全文重发）。
+# 默认收紧到 400 行 / 32KB（≈1 万 token 内），超长用 offset 续读；env 可调回旧值。
+MAX_LINES = _int_env("TOOL_MAX_LINES", 400)
+MAX_BYTES = _int_env("TOOL_MAX_BYTES", 32 * 1024)
 LIST_LIMIT = _int_env("TOOL_LIST_LIMIT", 500)
 GLOB_LIMIT = _int_env("TOOL_GLOB_LIMIT", 200)
 GREP_LIMIT = _int_env("TOOL_GREP_LIMIT", 100)
@@ -787,14 +789,14 @@ TOOL_SCHEMAS = [
             "name": "read_file",
             "description": (
                 "读取工作区内某个文本文件的内容（只读）。返回带行号的文本，"
-                "默认最多 2000 行，超长内容被截断时可用 offset 续读。"
+                "默认最多 400 行，超长内容被截断时可用 offset 续读。"
                 "二进制文件会被拒绝。路径相对于工作区根。"),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "工作区内文件的相对路径，如 ai/main.py"},
                     "offset": {"type": "integer", "description": "起始行号（从 1 开始），默认 1"},
-                    "limit": {"type": "integer", "description": "读取行数上限，默认 2000"},
+                    "limit": {"type": "integer", "description": "读取行数上限，默认 400"},
                 },
                 "required": ["path"],
             },
