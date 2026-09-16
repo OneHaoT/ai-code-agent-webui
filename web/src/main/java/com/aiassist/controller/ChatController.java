@@ -129,10 +129,14 @@ public class ChatController {
                 file.getBytes());
     }
 
-    /** 让 AI 模块在本机文件浏览器中打开默认工作区 */
+    /**
+     * 在系统文件浏览器中打开工作区目录。
+     * root 为空 = AI 默认工作区；非空 = 对话绑定的项目根绝对路径
+     * （与 /workspace/list 的 root 语义一致，由前端从当前绑定状态透传）。
+     */
     @PostMapping("/workspace/open")
-    public JsonNode openWorkspace() {
-        return aiClient.openWorkspace();
+    public JsonNode openWorkspace(@RequestParam(required = false) String root) {
+        return aiClient.openWorkspace(root);
     }
 
     /**

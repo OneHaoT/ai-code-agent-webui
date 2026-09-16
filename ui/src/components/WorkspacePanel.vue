@@ -151,8 +151,8 @@ function onDirSelected(e) {
 // ============ 打开工作区 ============
 async function openInExplorer() {
   try {
-    await api.openWorkspace()
-    toast.info('已请求在系统文件浏览器中打开默认工作区')
+    const body = await api.openWorkspace(props.workspaceRoot)
+    toast.info('已在系统文件浏览器中打开：' + (body?.path || props.workspaceRoot || '默认工作区'))
   } catch (e) {
     toast.error('打开失败：' + e.message)
   }

@@ -57,9 +57,10 @@ export const api = {
       return r.json()
     })
   },
-  /** 让 AI 模块在本机文件浏览器打开默认工作区 */
-  openWorkspace: () =>
-    request('/api/workspace/open', { method: 'POST' }),
+  /** 在系统文件浏览器打开工作区：root 空 = 默认工作区，非空 = 绑定项目根 */
+  openWorkspace: (root) =>
+    request('/api/workspace/open' + (root ? `?root=${encodeURIComponent(root)}` : ''),
+      { method: 'POST' }),
 
   /**
    * 只读浏览工作区单层目录（阶段3.5 项目树懒加载数据源）。

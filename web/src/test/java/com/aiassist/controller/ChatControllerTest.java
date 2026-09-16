@@ -128,4 +128,19 @@ class ChatControllerTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("越出工作区");
     }
+
+    @Test
+    void openWorkspace_nullRoot_omitsParam_boundRoot_passesThrough() {
+        // 未绑定（root=null）：ai 不带 root 参数 → 打开默认工作区
+        JsonNode defResp = new ObjectMapper().createObjectNode()
+                .put("path", "C:/ws/default");
+        when(aiClient.openWorkspace(null)).thenReturn(defResp);
+        assertThat(controller.openWorkspace(null)).isSameAs(defResp);
+
+        // 绑定项目：绑定根绝对路径透传给 ai → 打开项目根
+        JsonNode boundResp = new ObjectMapper().createObjectNode()
+                .put("path", "C:/code/sky-take-out");
+        when(aiClient.openWorkspace("C:/code/sky-take-out")).thenReturn(boundResp);
+        assertThat(controller.openWorkspace("C:/code/sky-take-out")).isSameAs(boundResp);
+    }
 }

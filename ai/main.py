@@ -19,6 +19,7 @@ import os
 import sys
 import json
 import heapq
+from pathlib import Path
 import logging
 import asyncio
 import uuid
@@ -394,11 +395,25 @@ async def upload_workspace_file(file: UploadFile = File(...)):
 
 
 @app.post("/workspace/open")
-def open_workspace():
-    """在操作系统文件浏览器中打开 AI 默认工作区目录。"""
+def open_workspace(root: str = ""):
+    """在操作系统文件浏览器中打开工作区目录（阶段3.5 增补：支持绑定工作区）。
+
+    - root 为空 = AI 默认工作区（向后兼容旧行为）；
+    - root 非空 = 用户拖入绑定的项目根绝对路径，由 web 侧从当前对话解析透传；
+    - 安全：os.startfile 对文件路径会用系统默认程序打开（等于可执行），
+      因此必须校验目标存在且是目录，且必须是绝对路径。
+    """
     import subprocess
     import sys
-    path = str(DEFAULT_WORKSPACE_DIR.resolve())
+    if root.strip():
+        p = Path(root)
+        if not p.is_absolute():
+            raise HTTPException(400, "root 必须是绝对路径")
+        if not p.is_dir():
+            raise HTTPException(400, "路径不存在或不是目录")
+        path = str(p)
+    else:
+        path = str(DEFAULT_WORKSPACE_DIR.resolve())
     try:
         if sys.platform.startswith("win"):
             os.startfile(path)  # Windows

@@ -307,10 +307,13 @@ public class AiClient {
                 .body(JsonNode.class);
     }
 
-    /** 让 AI 模块在本机文件浏览器中打开默认工作区目录。 */
-    public JsonNode openWorkspace() {
-        return restClient.post()
-                .uri("/workspace/open")
+    /** 让 AI 模块在本机文件浏览器中打开工作区目录（root 空 = 默认工作区）。 */
+    public JsonNode openWorkspace(String root) {
+        var spec = restClient.post().uri("/workspace/open");
+        if (root != null && !root.isBlank()) {
+            spec = spec.param("root", root);
+        }
+        return spec
                 .accept(MediaType.APPLICATION_JSON)
                 .retrieve()
                 .onStatus(HttpStatusCode::isError, (req, res) -> {

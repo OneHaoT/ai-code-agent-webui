@@ -156,3 +156,47 @@ def test_path_errors(client, ws_root):
     # 目标是文件而非目录
     r = client.get("/workspace/list", params={"root": str(ws_root), "path": "f.txt"})
     assert r.status_code == 400
+
+
+# ---------------- 打开工作区（root 空=默认 / 非空=绑定项目根） ----------------
+
+@pytest.fixture
+def opened(monkeypatch):
+    """捕获打开调用（Windows 走 os.startfile；一并兜住 Popen）。"""
+    calls = []
+    monkeypatch.setattr(main.os, "startfile", lambda p: calls.append(p),
+                        raising=False)
+    monkeypatch.setattr("subprocess.Popen",
+                        lambda *a, **k: calls.append(a[0]))
+    return calls
+
+
+def test_open_default_workspace(client, opened):
+    r = client.post("/workspace/open")
+    assert r.status_code == 200
+    assert r.json() == {"path": str(main.DEFAULT_WORKSPACE_DIR.resolve())}
+    assert opened == [str(main.DEFAULT_WORKSPACE_DIR.resolve())]
+
+
+def test_open_bound_project_root(client, ws_root, opened):
+    r = client.post("/workspace/open", params={"root": str(ws_root)})
+    assert r.status_code == 200
+    assert r.json() == {"path": str(ws_root)}
+    assert opened == [str(ws_root)]
+
+
+def test_open_rejects_file_path(client, ws_root, opened):
+    # os.startfile 对文件会用系统默认程序打开（可执行）→ 必须 400
+    f = ws_root / "evil.txt"
+    f.write_text("x", encoding="utf-8")
+    r = client.post("/workspace/open", params={"root": str(f)})
+    assert r.status_code == 400
+    assert opened == []
+
+
+def test_open_rejects_relative_and_missing(client, opened):
+    assert client.post("/workspace/open",
+                       params={"root": "proj/src"}).status_code == 400
+    assert client.post("/workspace/open",
+                       params={"root": "C:\\definitely\\not\\exist"}).status_code == 400
+    assert opened == []
