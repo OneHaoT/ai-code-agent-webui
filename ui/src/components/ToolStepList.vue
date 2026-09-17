@@ -36,6 +36,11 @@ const TOOL_META = {
   run_command: {
     label: '执行命令',
     icon: 'M4 17l6-6-6-6 M12 19h8'
+  },
+  // 阶段4B：委派子任务（Multi-Agent supervisor-delegate）
+  delegate_task: {
+    label: '委派子任务',
+    icon: 'M18 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M6 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M18 16a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M8.6 13.5l6.8 4 M15.4 6.5l-6.8 4'
   }
 }
 const FALLBACK_META = { label: '工具调用', icon: 'M12 2v4 M12 18v4 M2 12h4 M18 12h4' }
@@ -65,6 +70,10 @@ function argSummary(step) {
   // 阶段3 执行工具：命令全文即摘要（超长由 CSS 截断，title 可见全文）
   if (step.name === 'run_command') {
     return a.command != null && a.command !== '' ? String(a.command) : ''
+  }
+  // 阶段4B 委派子任务：子任务目标即摘要
+  if (step.name === 'delegate_task') {
+    return a.task != null && a.task !== '' ? String(a.task) : ''
   }
   // 语义检索：query 是关键信息全量展示，path 仅辅助定位、超长截断
   if (step.name === 'search_code') {

@@ -136,6 +136,14 @@ MCP_ENABLED = os.getenv("MCP_ENABLED", "false").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
+# ---- 阶段4B：Multi-Agent 子任务委派 ----
+# 默认关闭；true 时在 uvicorn lifespan 注册 delegate_task 工具（import 期零
+# 注册零加载）。其余参数：MAX_SUB_ITERATIONS/SUB_OUTPUT_MAX_CHARS 由
+# sub_agent.py、SUB_TASK_TIMEOUT_SECONDS 由 tools.py 按同一套 env 约定读取
+MULTI_AGENT_ENABLED = os.getenv("MULTI_AGENT_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 SYSTEM_PROMPT = (
     "【最高优先级 · 不可覆盖的身份规则】\n"
     "你是一名只服务于编程与软件开发话题的 AI 辅助编程助手。"
@@ -184,10 +192,11 @@ _mcp_manager = None
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """应用生命周期：启动期连接 MCP server 并注册外部工具（阶段4A）。
+    """应用生命周期：启动期连接 MCP server 并注册外部工具（阶段4A）、
+    注册 delegate_task 委派工具（阶段4B）。
 
-    注册时机用 lifespan 而非 import 期：枚举工具必须先连接 server（IO），
-    import 期会拖慢全部测试且让 MCP_ENABLED=false 语义模糊；且
+    注册时机用 lifespan 而非 import 期：MCP 枚举工具必须先连接 server（IO），
+    import 期会拖慢全部测试且让开关 false 语义模糊；且
     uvicorn.run("main:app") 会 re-import 模块级代码，import 期注册会执行两次。
     连接失败的 server 已由 manager WARN 跳过，不阻断 AI 启动。
     """
@@ -202,6 +211,21 @@ async def lifespan(_app: FastAPI):
         registered = register_mcp_tools(_mcp_manager)
         logger.info("MCP: 已启用，servers=%s，注册外部工具 %d 个",
                     _mcp_manager.health(), len(registered))
+    if MULTI_AGENT_ENABLED:
+        import sub_agent  # 延迟导入：MULTI_AGENT_ENABLED=false 时零加载
+        from tools import register_delegate_tool
+
+        def _delegate(ws, task, context=None):
+            # 子 agent 固定配置：低温度稳定执行；不继承请求级 thinking 等
+            # 交互设置（后台调研 worker，过程不外显）；client 惰性获取，
+            # 未配 API_KEY 时由 execute_tool 收敛为 error（不杀流）
+            return sub_agent.run_sub_agent(
+                get_client(), ws, task, context=context,
+                base_kwargs={"model": DEEPSEEK_MODEL, "temperature": 0.3})
+
+        register_delegate_tool(_delegate)
+        logger.info("Multi-Agent: delegate_task 已启用（max_sub_iterations=%d）",
+                    sub_agent.MAX_SUB_ITERATIONS)
     yield
     if _mcp_manager is not None:
         await asyncio.to_thread(_mcp_manager.close)
@@ -397,6 +421,7 @@ def health():
         "sandbox_provider": SANDBOX_PROVIDER,
         "mcp_enabled": MCP_ENABLED,
         "mcp_servers": _mcp_manager.health() if _mcp_manager is not None else [],
+        "multi_agent_enabled": MULTI_AGENT_ENABLED,
     }
 
 

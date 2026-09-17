@@ -4,6 +4,8 @@
 阶段3新增：write_file / run_command（本地受限沙箱，写/执行，confirm 前置）。
 阶段4A新增：register_mcp_tools —— 外部 MCP server 工具启动期动态并入
 （mcp_* 命名；未声明 read_only_hint=true 的一律 confirm，见 requires_confirm）。
+阶段4B新增：register_delegate_tool —— delegate_task（Multi-Agent 子任务委派，
+见 sub_agent.py）；execute_tool 增 allowed 白名单参数（子 agent 只读硬边界）。
 
 统一契约
 --------
@@ -955,16 +957,24 @@ def tool_available(name: str) -> bool:
     return name in _DISPATCH
 
 
-def execute_tool(ws: Workspace, name: str, args) -> ToolOutput:
+def execute_tool(ws: Workspace, name: str, args, allowed=None) -> ToolOutput:
     """编排层统一入口：任何异常都收敛为 error 工具结果，不允许杀整轮流。
 
     所有工具在隔离线程池中执行并施加硬超时兜底：默认 TOOL_TIMEOUT_SECONDS，
     个别工具经 _TOOL_TIMEOUTS 覆盖（run_command = EXEC_TIMEOUT_SECONDS+10，
-    须长于沙箱内部杀树超时）。灾难性正则回溯 / 网络盘 IO 挂起等无法在工具
+    delegate_task = SUB_TASK_TIMEOUT_SECONDS+10，须长于沙箱内部杀树超时/
+    子任务内部多轮模型调用的总时长）。
+
+    allowed（阶段4B）：子 agent 的只读硬边界——非 None 时 name 必须在集合内，
+    否则返回 error 且**不触碰任何 dispatch/磁盘**（先校验后执行，防模型幻觉
+    越权调用写工具）。主循环传 None（缺省）零影响。
+    灾难性正则回溯 / 网络盘 IO 挂起等无法在工具
     内部自检的场景，由 future.result(timeout) 统一兜底，保证请求线程以
     确定的 error 结果终结。Python 不能安全强杀线程：超时后仅放弃等待，
     worker 自然结束后回池。
     """
+    if allowed is not None and name not in allowed:
+        return _error(name, "该工具不在子任务可用范围内")
     fn = _DISPATCH.get(name)
     if fn is None:
         return _error(name or "<unknown>", f"未知工具：{name}")
@@ -1096,3 +1106,97 @@ def requires_confirm(name: str) -> bool:
 def get_mcp_meta(name: str) -> dict | None:
     """MCP 注册工具的元数据（agent._confirm_summary 生成确认摘要用）。"""
     return _MCP_TOOL_META.get(name)
+
+
+# ---------------- 阶段4B：Multi-Agent 子任务委派 ----------------
+#
+# delegate_task 由 main.py 在 uvicorn lifespan（MULTI_AGENT_ENABLED=true 时）
+# 经 register_delegate_tool(executor) 注册，与 MCP 注册同点（re-import 双跑免疫）。
+# tools.py 不 import sub_agent/main——executor 鸭子类型注入 fn(ws, **args) 形状
+# 闭包（照抄 register_mcp_tools 模式）。
+#
+# 只读硬边界：子 agent 工具集经 sub_toolset() 请求期现场过滤（非装配期快照，
+# 保证 MCP 注册后生效）——requires_confirm==False 且 tool_available 且显式排除
+# delegate_task 自身（名字排除是"两层封顶、禁止递归委派"的硬保证）。
+# execute_tool 的 allowed 参数在 dispatch 之前校验，越权零磁盘 IO。
+#
+# requires_confirm("delegate_task") 恒 False（只读无副作用，既有实现自动满足）。
+
+# 子任务总时长硬顶：经 _TOOL_TIMEOUTS 注册 per-tool 兜底超时（+10s 缓冲给
+# 子任务内部收尾）。注意 Python 线程不可强杀：超时后放弃等待、worker 自然
+# 结束回池（与既有 execute_tool 语义一致）
+SUB_TASK_TIMEOUT_SECONDS = _float_env("SUB_TASK_TIMEOUT_SECONDS", 600.0)
+
+_DELEGATE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "delegate_task",
+        "description": (
+            "把一个可独立完成的调研/分析型子任务委派给子 agent 执行："
+            "子 agent 拥有独立的只读工具集（读文件/列目录/文件名匹配/内容搜索"
+            "等）与独立轮次预算，适合需要多步骤探索、跨文件信息汇总的任务。"
+            "注意：子 agent 看不到当前对话历史，task 必须自包含全部必要信息"
+            "（目标、涉及哪些路径/文件、期望产出）；可用 context 补充已知背景。"
+            "返回执行摘要（轮次、工具调用计数与子 agent 结论）"),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "子任务目标描述，必须自包含（子 agent 无法看到当前"
+                        "对话历史），如：统计 web/src 下所有 Controller 类"
+                        "并列出各自暴露的接口路径"),
+                },
+                "context": {
+                    "type": "string",
+                    "description": "可选的补充背景/已知线索（相关文件路径、前文结论等）",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+
+def register_delegate_tool(executor) -> None:
+    """注册 delegate_task（幂等：先移除旧条目再注册，防重复注册）。
+
+    executor：fn(ws, task, context=None) -> ToolOutput（鸭子类型，由 main.py
+    传入绑定 sub_agent.run_sub_agent 的闭包）。传 None 时注册一个恒 error 的
+    兜底分发（"委派执行器未装配"，绝不杀流）。
+
+    TOOL_SCHEMAS 就地修改（[:] / append）——agent.py 持同一列表对象，与
+    register_mcp_tools 同一约束。
+    """
+    if executor is None:
+        def executor(ws, **args):  # noqa: F811 —— 兜底分发
+            return _error("delegate_task", "委派执行器未装配")
+    TOOL_SCHEMAS[:] = [s for s in TOOL_SCHEMAS
+                       if s["function"]["name"] != "delegate_task"]
+    _DISPATCH.pop("delegate_task", None)
+    TOOL_SCHEMAS.append(_DELEGATE_SCHEMA)
+    _DISPATCH["delegate_task"] = executor
+    _TOOL_TIMEOUTS["delegate_task"] = SUB_TASK_TIMEOUT_SECONDS + 10.0
+    logger.info("delegate_task 已注册（子任务超时兜底 %.0fs）",
+                SUB_TASK_TIMEOUT_SECONDS)
+
+
+def sub_toolset() -> tuple[list[dict], frozenset[str]]:
+    """子 agent 工具集（请求期现场过滤）。
+
+    返回 (schemas, allowed)：schemas 为可发给子 agent 的 OpenAI 工具声明，
+    allowed 为 execute_tool 的白名单名集合。二者同源——模型被告知什么，
+    就只能执行什么；allowed 之外的调用（幻觉越权）被硬拦截。
+    过滤规则：requires_confirm==False（内置只读五工具 + search_code + 声明
+    只读的 MCP 工具）且 tool_available 且显式排除 delegate_task。
+    """
+    schemas: list[dict] = []
+    names: list[str] = []
+    for s in TOOL_SCHEMAS:
+        n = s["function"]["name"]
+        if n == "delegate_task" or not tool_available(n) or requires_confirm(n):
+            continue
+        schemas.append(s)
+        names.append(n)
+    return schemas, frozenset(names)
