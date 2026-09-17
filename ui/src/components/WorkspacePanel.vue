@@ -31,6 +31,14 @@ function getDefaultWs() {
   return props.defaultWorkspace || '(AI 模块默认)'
 }
 
+// 界面展示用相对形式：绝对路径只保留尾部两段（隐藏盘符/用户目录等机器信息，
+// 避免截图/演示时暴露内部目录结构）；短路径原样显示，非路径文本不受影响
+function displayPath(p) {
+  if (!p) return p
+  const parts = String(p).split(/[\\/]/).filter(Boolean)
+  return parts.length <= 2 ? parts.join('/') : parts.slice(-2).join('/')
+}
+
 // ============ 拖拽 ============
 function onDragEnter(e) {
   if (!e.dataTransfer?.types?.includes('Files')) return
@@ -152,7 +160,7 @@ function onDirSelected(e) {
 async function openInExplorer() {
   try {
     const body = await api.openWorkspace(props.workspaceRoot)
-    toast.info('已在系统文件浏览器中打开：' + (body?.path || props.workspaceRoot || '默认工作区'))
+    toast.info('已在系统文件浏览器中打开：' + (displayPath(body?.path || props.workspaceRoot) || '默认工作区'))
   } catch (e) {
     toast.error('打开失败：' + e.message)
   }
@@ -312,7 +320,7 @@ watch(
     <!-- 树视图：已绑定项目（IDE 风格项目管理器） -->
     <template v-if="workspaceRoot">
       <div class="tree-header">
-        <div class="tree-project" :title="workspaceRoot">{{ treeRoot?.name || '…' }}</div>
+        <div class="tree-project" :title="displayPath(workspaceRoot)">{{ treeRoot?.name || '…' }}</div>
         <div class="tree-actions">
           <button class="tree-btn" title="刷新" @click="refreshTree">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -390,7 +398,7 @@ watch(
         <div class="ws-label">当前工作区</div>
         <div class="ws-path ws-default">
           <span class="ws-default-label">默认</span>
-          <span class="ws-default-path" :title="getDefaultWs()">{{ getDefaultWs() }}</span>
+          <span class="ws-default-path" :title="displayPath(getDefaultWs())">{{ displayPath(getDefaultWs()) }}</span>
           <button class="ws-open" title="在系统文件浏览器中打开" @click="openInExplorer">打开</button>
         </div>
       </div>
