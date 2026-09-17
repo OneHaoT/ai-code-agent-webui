@@ -2,6 +2,8 @@
 阶段1只读工具集：read_file / list_dir / glob / grep。
 阶段2新增：search_code（语义检索，只读）。
 阶段3新增：write_file / run_command（本地受限沙箱，写/执行，confirm 前置）。
+阶段4A新增：register_mcp_tools —— 外部 MCP server 工具启动期动态并入
+（mcp_* 命名；未声明 read_only_hint=true 的一律 confirm，见 requires_confirm）。
 
 统一契约
 --------
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import fnmatch
 import heapq
+import logging
 import os
 import re
 import stat
@@ -37,6 +40,8 @@ import sandbox as _sandbox
 from sandbox import SandboxError
 
 from workspace import DEFAULT_IGNORE_DIRS, Workspace, WorkspaceViolation
+
+logger = logging.getLogger("ai-assist")
 
 
 def _int_env(key: str, default: int) -> int:
@@ -986,3 +991,108 @@ def execute_tool(ws: Workspace, name: str, args) -> ToolOutput:
         return _error(name, f"工具参数不合法：{e}")
     except Exception as e:  # noqa: BLE001 —— 工具层最后的收敛防线
         return _error(name, f"工具执行异常：{type(e).__name__}: {e}")
+
+
+# ---------------- 阶段4A：MCP 外部工具注册 ----------------
+#
+# MCP_ENABLED=true 时由 main.py 在 uvicorn lifespan 启动期调用
+# register_mcp_tools(manager)：把外部 server 声明的工具动态并入 TOOL_SCHEMAS
+# 与 _DISPATCH（import 期零加载；manager 鸭子类型访问，tools 不 import mcp
+# 包，也不 import mcp_client）。注册后的工具与内置工具同走 execute_tool
+# 统一线程池 / per-tool 超时 / 参数校验 / 异常收敛，同受 MAX_TOOL_ITERATIONS
+# 约束；输出截断在闭包内按 TOOL_MAX_BYTES 复用既有语义。
+#
+# 命名规则：mcp_{server}_{tool}——先 sanitize（非法字符替换 _），总长超 64
+# 字符（OpenAI function name 上限）截断；sanitize+截断后重名的工具跳过注册
+# 并记 WARN（配置错误显式暴露，不静默改号）。
+#
+# confirm 门控（requires_confirm）：内置 write_file/run_command 恒需要；
+# MCP 工具未声明 read_only_hint=true 一律需要；其余（内置只读 + 声明只读
+# 的 MCP）不需要。
+
+_MCP_NAME_MAX = 64                    # OpenAI function name 上限
+# 注册名 -> {server, tool, read_only_hint}（requires_confirm / 确认摘要用）
+_MCP_TOOL_META: dict[str, dict] = {}
+
+
+def _sanitize_mcp_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", s or "")
+
+
+def register_mcp_tools(manager) -> list[str]:
+    """把 manager 枚举到的外部 MCP 工具并入工具集，返回注册名列表。
+
+    manager 需提供（鸭子类型，见 mcp_client.MCPManager）：
+      iter_connected_tools() -> (server, {name, description, input_schema,
+                                          read_only_hint}) 迭代；
+      call_tool(server, tool, args) -> (is_error, text)；
+      tool_timeout: float。
+    注意：往 TOOL_SCHEMAS 就地 append——agent.py `from tools import
+    TOOL_SCHEMAS` 拿到的是同一列表对象，重绑定不可见，就地追加才可见。
+    """
+    timeout = float(getattr(manager, "tool_timeout", 60.0))
+    added: list[str] = []
+    for server, tool in manager.iter_connected_tools():
+        reg = (f"mcp_{_sanitize_mcp_name(server)}"
+               f"_{_sanitize_mcp_name(tool['name'])}")[:_MCP_NAME_MAX]
+        if reg in _DISPATCH:
+            logger.warning("MCP 工具命名冲突，跳过注册：server=%s tool=%s "
+                           "name=%s", server, tool["name"], reg)
+            continue
+        desc = (tool.get("description") or "").strip()
+        schema = {
+            "type": "function",
+            "function": {
+                "name": reg,
+                "description": (
+                    f"（来自外部 MCP server {server}）"
+                    + (desc or "外部工具（server 未提供描述）")),
+                "parameters": tool.get("input_schema") or {
+                    "type": "object", "properties": {}},
+            },
+        }
+
+        def _make(server=server, tool_name=tool["name"], reg=reg):
+            def _call(ws, **args):  # ws 仅为保持 dispatch fn(ws, **args) 形状，不外传
+                is_error, text = manager.call_tool(server, tool_name, args)
+                raw = text.encode("utf-8")
+                truncated = False
+                if len(raw) > MAX_BYTES:
+                    text = (raw[:MAX_BYTES].decode("utf-8", errors="ignore")
+                            + "\n…（输出超限截断）")
+                    truncated = True
+                return ToolOutput(name=reg,
+                                  status="error" if is_error else "success",
+                                  output=text, truncated=truncated)
+            return _call
+
+        TOOL_SCHEMAS.append(schema)
+        _DISPATCH[reg] = _make()
+        _TOOL_TIMEOUTS[reg] = timeout + 5.0  # 协程内部超时 + 桥接层缓冲
+        _MCP_TOOL_META[reg] = {"server": server, "tool": tool["name"],
+                               "read_only_hint": bool(tool.get("read_only_hint"))}
+        added.append(reg)
+        logger.info("MCP 工具已注册：%s（server=%s, read_only=%s）",
+                    reg, server, bool(tool.get("read_only_hint")))
+    return added
+
+
+def requires_confirm(name: str) -> bool:
+    """工具执行前是否需要 confirm 人机确认（agent.py 门控用）。
+
+    内置 write_file/run_command 恒 True；MCP 工具未声明 read_only_hint=true
+    一律 True；其余（内置只读 + 声明只读的 MCP）False。未注册的 mcp_* 名
+    不在 META → False（agent 的 tool_available 判断会让它走"未知工具"降级，
+    不进 confirm）。
+    """
+    if name in CONFIRM_TOOLS:
+        return True
+    meta = _MCP_TOOL_META.get(name)
+    if meta is None:
+        return False
+    return not meta["read_only_hint"]
+
+
+def get_mcp_meta(name: str) -> dict | None:
+    """MCP 注册工具的元数据（agent._confirm_summary 生成确认摘要用）。"""
+    return _MCP_TOOL_META.get(name)

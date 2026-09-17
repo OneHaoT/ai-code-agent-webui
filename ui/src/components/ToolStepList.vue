@@ -39,8 +39,15 @@ const TOOL_META = {
   }
 }
 const FALLBACK_META = { label: '工具调用', icon: 'M12 2v4 M12 18v4 M2 12h4 M18 12h4' }
+// 阶段4A：外部 MCP 工具（mcp_{server}_{tool}，动态注册、名称不可枚举）——
+// 通用连接图标 + 原始工具名，其余折叠/展开/耗时/错误态复用既有实现
+const MCP_META = {
+  label: '外部工具',
+  icon: 'M9 7H7a5 5 0 0 0 0 10h2 M15 7h2a5 5 0 0 1 0 10h-2 M8 12h8'
+}
 
 function metaOf(name) {
+  if (name && name.startsWith('mcp_')) return { ...MCP_META, label: name }
   return TOOL_META[name] || { ...FALLBACK_META, label: name || '工具调用' }
 }
 
@@ -67,6 +74,13 @@ function argSummary(step) {
       parts.push(p.length > 24 ? p.slice(0, 21) + '…' : p)
     }
     return parts.join('  ·  ')
+  }
+  // 阶段4A 外部 MCP 工具：参数结构不可枚举，取一层键值拼摘要（超长截断）
+  if (step.name && step.name.startsWith('mcp_')) {
+    const s = Object.entries(a)
+      .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+      .join('  ·  ')
+    return s.length > 60 ? s.slice(0, 57) + '…' : s
   }
   if (a.pattern != null && a.pattern !== '') parts.push(String(a.pattern))
   const target = a.path

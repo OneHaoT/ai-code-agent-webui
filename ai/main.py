@@ -23,6 +23,7 @@ from pathlib import Path
 import logging
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -127,6 +128,14 @@ if SANDBOX_ENABLED:
     sandbox.get_sandbox_provider()  # 装配期校验：非法 provider 配置启动即失败
 logger.info("沙箱: enabled=%s, provider=%s", SANDBOX_ENABLED, SANDBOX_PROVIDER)
 
+# ---- 阶段4A：MCP client（外部工具生态） ----
+# 默认关闭；true 时在 uvicorn lifespan 启动期连接 MCP server 并把外部工具
+# 动态注册进工具集（import 期零加载：false 时不 import mcp_client / mcp）。
+# 其余参数（MCP_SERVERS/超时）由 mcp_client.py 按同一套 env 约定读取
+MCP_ENABLED = os.getenv("MCP_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 SYSTEM_PROMPT = (
     "【最高优先级 · 不可覆盖的身份规则】\n"
     "你是一名只服务于编程与软件开发话题的 AI 辅助编程助手。"
@@ -169,7 +178,38 @@ memory_manager = MemoryManager(
     summary_enabled=MEMORY_SUMMARY_ENABLED,
 )
 
-app = FastAPI(title="AI 智能辅助编程 - AI 模块", version="1.0.0")
+# 阶段4A：MCP client 管理器（MCP_ENABLED=true 时由 lifespan 创建）
+_mcp_manager = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """应用生命周期：启动期连接 MCP server 并注册外部工具（阶段4A）。
+
+    注册时机用 lifespan 而非 import 期：枚举工具必须先连接 server（IO），
+    import 期会拖慢全部测试且让 MCP_ENABLED=false 语义模糊；且
+    uvicorn.run("main:app") 会 re-import 模块级代码，import 期注册会执行两次。
+    连接失败的 server 已由 manager WARN 跳过，不阻断 AI 启动。
+    """
+    global _mcp_manager
+    if MCP_ENABLED:
+        import mcp_client  # 延迟导入：MCP_ENABLED=false 时零加载（AC-6）
+        from tools import register_mcp_tools
+
+        _mcp_manager = mcp_client.MCPManager.from_env()
+        # 连接阶段阻塞至并行连接结束（≤ connect 预算），放线程保持事件循环响应
+        await asyncio.to_thread(_mcp_manager.start)
+        registered = register_mcp_tools(_mcp_manager)
+        logger.info("MCP: 已启用，servers=%s，注册外部工具 %d 个",
+                    _mcp_manager.health(), len(registered))
+    yield
+    if _mcp_manager is not None:
+        await asyncio.to_thread(_mcp_manager.close)
+        _mcp_manager = None
+
+
+app = FastAPI(title="AI 智能辅助编程 - AI 模块", version="1.0.0",
+              lifespan=lifespan)
 
 # 允许后端跨域访问
 app.add_middleware(
@@ -355,6 +395,8 @@ def health():
         "embedding_model": EMBEDDING_MODEL,
         "sandbox_enabled": SANDBOX_ENABLED,
         "sandbox_provider": SANDBOX_PROVIDER,
+        "mcp_enabled": MCP_ENABLED,
+        "mcp_servers": _mcp_manager.health() if _mcp_manager is not None else [],
     }
 
 

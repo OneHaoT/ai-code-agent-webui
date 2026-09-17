@@ -19,9 +19,10 @@
 3. 支持单轮并行多个 tool_calls（按 id 回填）；循环上限 max_iterations：
    达到上限的那一轮工具照执行并注入“直接作答”提示，给模型一次收敛机会；
    收敛轮请求物理不带 tools 键（模型只能文字回答，正常路径不再硬中断）；
-4. confirm 人机确认（阶段3）：write_file / run_command（tools.CONFIRM_TOOLS）
-   在 tool_call 帧之后、执行之前发 confirm 帧 {id, tool, summary} 并挂起等待
-   用户决策（POST /ai/confirm 唤醒）；确认→执行，拒绝/超时→回填 error
+4. confirm 人机确认（阶段3/4A）：内置 write_file / run_command，以及 MCP
+   外部工具中未声明 read_only_hint=true 的（tools.requires_confirm 判定）
+   在 tool_call 帧之后、执行之前发 confirm 帧 {id, tool, summary} 并挂起
+   等待用户决策（POST /ai/confirm 唤醒）；确认→执行，拒绝/超时→回填 error
    tool_result，磁盘零副作用。配对契约不变：每个 tool_call 必有同 id
    tool_result（拒绝/超时也回填）；只读工具零 confirm。
 5. 历史工具输出瘦身（token 治理）：编程 agent 读写频繁，工具循环每轮都会
@@ -43,8 +44,8 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import START, END, StateGraph
 from langgraph.config import get_stream_writer
 
-from tools import (CONFIRM_TOOLS, TOOL_SCHEMAS, Workspace, execute_tool,
-                   tool_available)
+from tools import (TOOL_SCHEMAS, Workspace, execute_tool, get_mcp_meta,
+                   requires_confirm, tool_available)
 from workspace import Workspace, WorkspaceViolation
 
 logger = logging.getLogger("ai-assist")
@@ -132,9 +133,19 @@ def reject_pending_confirms(stream_id: str | None) -> int:
 
 
 def _confirm_summary(name: str, args: Any, ws: Workspace) -> str:
-    """生成给用户看的确认摘要（write_file：新建/覆盖+路径+内容预览；run_command：命令全文）。"""
+    """生成给用户看的确认摘要（write_file：新建/覆盖+路径+内容预览；run_command：命令全文；MCP：server/tool+参数预览）。"""
     if not isinstance(args, dict):
         return f"调用 {name}（参数异常，执行时将被拒绝）"
+    if name.startswith("mcp_"):
+        meta = get_mcp_meta(name) or {}
+        try:
+            preview = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            preview = str(args)
+        if len(preview) > 200:
+            preview = preview[:200] + "…"
+        return (f"调用外部 MCP 工具（{meta.get('server', '?')} 的 "
+                f"{meta.get('tool', name)}），参数：{preview}")
     if name == "write_file":
         path = args.get("path")
         content = args.get("content")
@@ -375,11 +386,12 @@ def compile_tool_graph(client: Any, workspace: Workspace,
                 writer({"type": "tool_result", "id": call_id, "name": name,
                         "status": "error", "output": content, "truncated": False})
             else:
-                # ---- 阶段3：写/执行工具 confirm 人机确认 ----
-                # 门控 = CONFIRM_TOOLS 且工具在当前装配工具集中：
-                # SANDBOX_ENABLED=false 时写工具不可用，走"未知工具"降级，无 confirm
+                # ---- 阶段3/4A：confirm 人机确认 ----
+                # 门控 = requires_confirm（内置写/执行工具 ∪ MCP 未声明只读）
+                # 且工具在当前装配工具集中：SANDBOX/MCP 不可用时走"未知工具"
+                # 降级，无 confirm
                 entry: ConfirmEntry | None = None
-                if name in CONFIRM_TOOLS and tool_available(name):
+                if requires_confirm(name) and tool_available(name):
                     summary = _confirm_summary(name, args, workspace)
                     entry = create_confirm(name, summary, stream_id)
                     writer({"type": "confirm", "id": entry.id,

@@ -16,5 +16,8 @@ numpy>=2.5.3
 PyMuPDF>=1.24.0
 python-multipart>=0.0.9
 
+# 阶段4A：MCP client（接入外部 MCP server，stdio 传输；下限锁 venv 实测版本）
+mcp>=2.2.0
+
 # 测试（tests/）
 pytest>=8.0.0
