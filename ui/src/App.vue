@@ -85,8 +85,13 @@ onMounted(async () => {
   // 用户发送第一条消息时才按需自动创建（见 sendMessage）
   await loadConversations()
   await refreshAiStatus()
+  refreshFeatures()
   // AI 模块可能在使用中途宕机：周期轻量轮询让头部状态灯保持真实
-  statusTimer = setInterval(refreshAiStatus, 30000)
+  statusTimer = setInterval(() => {
+    refreshAiStatus()
+    // 功能开关加载失败（AI 宕机）时随轮询自动重试
+    if (!features.value) refreshFeatures()
+  }, 30000)
   window.addEventListener('beforeunload', onBeforeUnload)
   window.addEventListener('dragover', blockWindowFileDrop)
   window.addEventListener('drop', blockWindowFileDrop)
@@ -104,6 +109,55 @@ async function refreshAiStatus() {
   try {
     aiStatus.value = await api.aiStatus()
   } catch (_) {}
+}
+
+// ---------------- 阶段4C：功能开关（MCP / Multi-Agent，状态以后端为准） ----------------
+
+// null = 尚未加载成功或 AI 不可用（输入框 pills 显示禁用态）
+const features = ref(null)
+
+async function refreshFeatures() {
+  try {
+    features.value = await api.getFeatures()
+  } catch (_) {
+    features.value = null
+  }
+}
+
+/** pill 切换：乐观更新 → POST → 回读后端全量态；失败回滚 + toast.error */
+async function toggleFeature(key, next) {
+  const prev = features.value
+  if (!prev || prev[key] === next) return
+  features.value = { ...prev, [key]: next }
+  try {
+    features.value = await api.updateFeatures({ [key]: next })
+    toast.info(key === 'mcp_enabled'
+      ? (next ? 'MCP 工具已开启，可点击齿轮配置 server' : 'MCP 工具已关闭')
+      : (next ? '任务委派已开启，AI 可拆解委派子任务' : '任务委派已关闭'))
+  } catch (e) {
+    features.value = prev
+    toast.error(e.message || '切换失败，请稍后重试')
+  }
+}
+
+/**
+ * MCP 配置弹层保存（mcp_servers 变更即热重连）。
+ * onDone/onFail 由弹层回调：成功关弹层、失败保留内容并显示后端 400 原因。
+ */
+async function saveMcpServers({ servers, onDone, onFail }) {
+  const prev = features.value
+  try {
+    features.value = await api.updateFeatures({ mcp_servers: servers })
+    onDone?.()
+    const health = features.value.mcp_servers_health || []
+    const ok = health.filter((h) => h.status === 'connected').length
+    toast.info(health.length
+      ? `MCP 配置已保存：${ok}/${health.length} 个 server 已连接`
+      : 'MCP 配置已保存（当前无 server）')
+  } catch (e) {
+    features.value = prev
+    onFail?.(e.message)
+  }
 }
 
 // 生成/上传中刷新或关闭页面：提示用户（请求可能仍在后台完成并落库）
@@ -521,6 +575,7 @@ async function retrySend(failedMsg) {
       :uploading="uploading"
       :pending-thinking="pendingThinking"
       :ai-status="aiStatus"
+      :features="features"
       :sidebar-collapsed="sidebarCollapsed"
       :workspace-collapsed="workspaceCollapsed"
       @toggle-sidebar="toggleSidebar"
@@ -529,6 +584,8 @@ async function retrySend(failedMsg) {
       @stop="stopGeneration"
       @retry="retrySend"
       @confirm-decide="decideConfirm"
+      @toggle-feature="toggleFeature"
+      @save-mcp-servers="saveMcpServers"
       @new="createConversation"
     />
     <WorkspacePanel

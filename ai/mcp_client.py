@@ -42,6 +42,11 @@ from mcp.shared.exceptions import MCPError
 
 logger = logging.getLogger("ai-assist")
 
+# 阶段4C：配置解析迁至 feature_config（纯函数、零 mcp SDK 依赖，使
+# 「MCP_ENABLED=false 零 mcp 模块加载」契约可被 main.py 顶层链路保持）；
+# 此处 re-export 保持既有引用路径兼容
+from feature_config import parse_servers_config  # noqa: E402
+
 
 def _float_env(key: str, default: float) -> float:
     try:
@@ -49,36 +54,6 @@ def _float_env(key: str, default: float) -> float:
     except (TypeError, ValueError):
         logger.warning("%s 非法，回退 %s", key, default)
         return default
-
-
-def parse_servers_config(raw: str | None) -> list[dict]:
-    """解析 MCP_SERVERS JSON 配置；坏条目 WARN 跳过（不抛异常）。
-
-    条目格式：{"name": "fs", "command": "npx", "args": [...], "env": {...}}。
-    name/command 必填；args/env 可选。全部非法时返回 []（等效未启用）。
-    """
-    try:
-        servers = json.loads(raw or "[]")
-    except json.JSONDecodeError as e:
-        logger.warning("MCP_SERVERS 不是合法 JSON：%s（按无 server 处理）", e)
-        return []
-    if not isinstance(servers, list):
-        logger.warning("MCP_SERVERS 必须是 JSON 数组（按无 server 处理）")
-        return []
-    valid: list[dict] = []
-    for i, item in enumerate(servers):
-        if (not isinstance(item, dict) or not str(item.get("name", "")).strip()
-                or not str(item.get("command", "")).strip()):
-            logger.warning("MCP_SERVERS[%d] 缺 name/command 或不是对象，已跳过", i)
-            continue
-        entry = {
-            "name": str(item["name"]).strip(),
-            "command": str(item["command"]).strip(),
-            "args": [str(a) for a in item.get("args") or []],
-            "env": {str(k): str(v) for k, v in (item.get("env") or {}).items()},
-        }
-        valid.append(entry)
-    return valid
 
 
 class _ServerState:
@@ -117,8 +92,14 @@ class MCPManager:
     # ---- 配置 ----
 
     @classmethod
-    def from_env(cls) -> "MCPManager":
-        servers = parse_servers_config(os.getenv("MCP_SERVERS"))
+    def from_env(cls, servers_json: str | None = None) -> "MCPManager":
+        """从配置构建管理器。
+
+        servers_json=None：读 .env 的 MCP_SERVERS（既有行为）；
+        传入 JSON 字符串：用它替代 env（阶段4C 前端热配置），其余参数不变。
+        """
+        raw = servers_json if servers_json is not None else os.getenv("MCP_SERVERS")
+        servers = parse_servers_config(raw)
         return cls(
             servers,
             connect_timeout=_float_env("MCP_CONNECT_TIMEOUT_SECONDS", 10.0),

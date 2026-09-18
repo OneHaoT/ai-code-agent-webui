@@ -321,8 +321,9 @@ def test_health_shows_multi_agent_disabled_by_default(monkeypatch):
     from fastapi.testclient import TestClient
     import main
 
-    monkeypatch.setattr(main, "MULTI_AGENT_ENABLED", False)
-    monkeypatch.setattr(main, "MCP_ENABLED", False)
+    # 阶段4C 起 /health 读 _features_state：直接置字段并还原（setitem 自动恢复）
+    monkeypatch.setitem(main._features_state, "multi_agent_enabled", False)
+    monkeypatch.setitem(main._features_state, "mcp_enabled", False)
     monkeypatch.setattr(main, "_mcp_manager", None)
     c = TestClient(main.app)
     r = c.get("/health")
@@ -350,7 +351,13 @@ def test_multi_agent_enabled_registers_delegate_subprocess():
     """子进程装配：MULTI_AGENT_ENABLED=true（无真实模型调用）时经 lifespan
     注册 delegate_task，requires_confirm 恒 False。"""
     code = "\n".join([
-        "import sys; sys.path.insert(0, '.')",
+        "import sys, os, tempfile; sys.path.insert(0, '.')",
+        # 隔离 features.json：文件优先于 env，不指走的话开发者本地 E2E
+        # 产生的真实 config/features.json 会覆盖本测试的 MULTI_AGENT_ENABLED
+        "import feature_config",
+        "_d = tempfile.mkdtemp()",
+        "feature_config.CONFIG_DIR = _d",
+        "feature_config.CONFIG_PATH = os.path.join(_d, 'features.json')",
         "import main",
         "from fastapi.testclient import TestClient",
         "import tools",

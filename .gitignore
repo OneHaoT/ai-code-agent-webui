@@ -42,6 +42,8 @@ ai/workspace_default/
 # 阶段2 RAG：embedding 模型缓存与向量索引（本地派生数据，不入版本库）
 ai/model_cache/
 ai/index_store/
+# 阶段4C 前端功能开关：运行时持久化配置（mcp_servers 的 env 可能含 token，不入库）
+ai/config/
 
 # ========== 操作系统/编辑器杂项 ==========
 .DS_Store

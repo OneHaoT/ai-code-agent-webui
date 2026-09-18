@@ -270,12 +270,16 @@ def test_mcp_false_convergence_round_has_no_tools_key(ws, mcp_tools):
 # ---------------- /health 外显与子进程装配隔离 ----------------
 
 def test_health_shows_mcp_disabled_by_default(monkeypatch):
-    """MCP_ENABLED=false（默认）：/health 如实外显，未注册任何 mcp_* 工具。"""
+    """MCP 关闭（默认态）：/health 如实外显，未注册任何 mcp_* 工具。
+
+    阶段4C 起 /health 读 _features_state（features.json 优先、env 回落），
+    测试直接置状态字段并还原（setitem teardown 自动恢复原值）。
+    """
     from fastapi.testclient import TestClient
     import main
 
-    # 防本地 .env 临时开启 MCP（E2E 期）影响断言
-    monkeypatch.setattr(main, "MCP_ENABLED", False)
+    # 防本地 features.json/.env 临时开启 MCP（E2E 期）影响断言
+    monkeypatch.setitem(main._features_state, "mcp_enabled", False)
     monkeypatch.setattr(main, "_mcp_manager", None)
     c = TestClient(main.app)
     r = c.get("/health")

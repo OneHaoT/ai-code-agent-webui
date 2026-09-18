@@ -367,4 +367,40 @@ public class AiClient {
         }
         return "AI 模块拒绝了该请求";
     }
+
+    /**
+     * 查询功能开关全量状态（阶段4C：MCP / Multi-Agent 前端热切换数据源）。
+     * 转发 GET /ai/features；ai 不可达 → AiServiceException（502，与既有降级一致）。
+     */
+    public JsonNode getFeatures() {
+        return restClient.get()
+                .uri("/ai/features")
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, (req, res) -> {
+                    throw new AiServiceException("查询功能开关失败: " + res.getStatusCode());
+                })
+                .body(JsonNode.class);
+    }
+
+    /**
+     * 热切换功能开关（阶段4C）：body 原样透传 POST /ai/features。
+     * ai 侧 400（mcp_servers 结构非法等请求本身非法）→ IllegalArgumentException
+     * 透传 400 并携带 ai 的 detail 中文原因；其余错误 → AiServiceException（502）。
+     */
+    public JsonNode updateFeatures(JsonNode body) {
+        return restClient.post()
+                .uri("/ai/features")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(body)
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .onStatus(status -> status.value() == 400, (req, res) -> {
+                    throw new IllegalArgumentException(aiErrorDetail(res));
+                })
+                .onStatus(HttpStatusCode::isError, (req, res) -> {
+                    throw new AiServiceException("更新功能开关失败: " + res.getStatusCode());
+                })
+                .body(JsonNode.class);
+    }
 }

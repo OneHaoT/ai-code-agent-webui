@@ -4,9 +4,11 @@ import { useToast } from '../composables/useToast.js'
 import { compressImage } from '../utils/imageCompress.js'
 
 const props = defineProps({
-  sending: { type: Boolean, default: false }
+  sending: { type: Boolean, default: false },
+  // 阶段4C 功能开关全量状态（App.vue 持有；null = 未加载/AI 不可用）
+  features: { type: Object, default: null }
 })
-const emit = defineEmits(['send', 'stop'])
+const emit = defineEmits(['send', 'stop', 'toggle-feature', 'save-mcp-servers'])
 
 const toast = useToast()
 
@@ -26,6 +28,60 @@ const attachments = ref([])
 // 深度思考开关（DeepSeek thinking 模式），选择持久化到 localStorage
 const thinking = ref(localStorage.getItem('ai-thinking-enabled') === '1')
 watch(thinking, (v) => localStorage.setItem('ai-thinking-enabled', v ? '1' : '0'))
+
+// ---------------- 阶段4C：功能开关 pills（状态以后端为准，不写 localStorage） ----------------
+
+const featuresReady = computed(() => !!props.features)
+const mcpOn = computed(() => !!props.features?.mcp_enabled)
+const delegateOn = computed(() => !!props.features?.multi_agent_enabled)
+const featureDisabled = computed(() => props.sending || !featuresReady.value)
+
+// MCP 配置弹层（自绘，禁原生弹窗）：text 为 textarea 内容、error 为校验/后端错误
+const mcpDialog = ref({ show: false, text: '', error: '', saving: false })
+
+function openMcpDialog() {
+  mcpDialog.value = {
+    show: true,
+    saving: false,
+    error: '',
+    // 预填当前生效配置（格式化缩进，便于直接编辑）
+    text: JSON.stringify(props.features?.mcp_servers ?? [], null, 2)
+  }
+}
+
+function closeMcpDialog() {
+  if (mcpDialog.value.saving) return
+  mcpDialog.value.show = false
+}
+
+function saveMcpDialog() {
+  if (mcpDialog.value.saving) return
+  let parsed
+  try {
+    parsed = JSON.parse(mcpDialog.value.text || '[]')
+  } catch (e) {
+    mcpDialog.value.error = `JSON 格式错误：${e.message}`
+    return
+  }
+  if (!Array.isArray(parsed)) {
+    mcpDialog.value.error = '必须是 JSON 数组（每条为 {name, command, args, env} 对象），空配置填 []'
+    return
+  }
+  mcpDialog.value.error = ''
+  mcpDialog.value.saving = true
+  // 保存结果由 App.vue 回调：成功关弹层，失败保留内容并显示后端 400 原因
+  emit('save-mcp-servers', {
+    servers: parsed,
+    onDone: () => {
+      mcpDialog.value.saving = false
+      mcpDialog.value.show = false
+    },
+    onFail: (msg) => {
+      mcpDialog.value.saving = false
+      mcpDialog.value.error = msg || '保存失败，请稍后重试'
+    }
+  })
+}
 
 const canSend = computed(
   () => !props.sending && (!!text.value.trim() || attachments.value.length > 0)
@@ -183,7 +239,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 模式工具行：深度思考开关 -->
+    <!-- 模式工具行：深度思考 / MCP 工具 / 任务委派 -->
     <div class="toolbar">
       <button
         type="button"
@@ -199,6 +255,60 @@ onBeforeUnmount(() => {
         </svg>
         <span>深度思考</span>
       </button>
+
+      <button
+        type="button"
+        class="think-chip"
+        :class="{ on: mcpOn }"
+        :disabled="featureDisabled"
+        :aria-pressed="mcpOn"
+        :title="!featuresReady
+          ? '功能状态加载中或 AI 模块不可用'
+          : (mcpOn ? 'MCP 工具已开启（点击齿轮配置 server，点击关闭）' : '开启后 AI 可调用外部 MCP server 工具')"
+        @click="emit('toggle-feature', 'mcp_enabled', !mcpOn)"
+      >
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 6h-8l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2z" />
+          <path d="M14 13a2 2 0 1 0 4 0 2 2 0 0 0-4 0z" />
+        </svg>
+        <span>MCP 工具</span>
+      </button>
+      <!-- 配置入口：仅 MCP 开启时显示 -->
+      <button
+        v-if="mcpOn"
+        type="button"
+        class="chip-gear"
+        :disabled="featureDisabled"
+        title="配置 MCP server（JSON）"
+        aria-label="配置 MCP server"
+        @click="openMcpDialog"
+      >
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+      </button>
+
+      <button
+        type="button"
+        class="think-chip"
+        :class="{ on: delegateOn }"
+        :disabled="featureDisabled"
+        :aria-pressed="delegateOn"
+        :title="!featuresReady
+          ? '功能状态加载中或 AI 模块不可用'
+          : (delegateOn ? '任务委派已开启（复杂任务 AI 可委派只读子代理调研）' : '开启后 AI 可将调研类子任务委派给内部子代理')"
+        @click="emit('toggle-feature', 'multi_agent_enabled', !delegateOn)"
+      >
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="6" cy="4" r="2.2" />
+          <circle cx="18" cy="9" r="2.2" />
+          <circle cx="12" cy="19" r="2.2" />
+          <path d="M7.8 5.2 16 8.2M16.8 10.8 13 17.2M4.6 6.1 10.8 17.2" />
+        </svg>
+        <span>任务委派</span>
+      </button>
+
       <Transition name="hint-fade">
         <span v-if="thinking" class="think-hint" aria-live="polite">
           已开启：AI 会先推理再作答，复杂问题更准，但耗时更长
@@ -281,6 +391,36 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <div class="hint">AI 辅助编程 · 基于 DeepSeek，回答仅供参考 · 支持拖拽 / 粘贴图片</div>
+
+    <!-- MCP server 配置弹层（自绘，trustDialog 同款遮罩模式，禁原生弹窗） -->
+    <Transition name="fade">
+      <div v-if="mcpDialog.show" class="mcp-backdrop" @click.self="closeMcpDialog">
+        <div class="mcp-dialog" role="dialog" aria-label="MCP server 配置" @click.stop>
+          <div class="mcp-title">MCP server 配置</div>
+          <p class="mcp-desc">
+            JSON 数组，每条：<code>{name, command, args, env}</code>（name/command 必填）。
+            保存后立即热连接；server 以当前用户权限运行，请只配置可信来源。
+          </p>
+          <textarea
+            v-model="mcpDialog.text"
+            class="mcp-textarea"
+            rows="10"
+            spellcheck="false"
+            :disabled="mcpDialog.saving"
+            @keydown.esc.prevent="closeMcpDialog"
+          ></textarea>
+          <p v-if="mcpDialog.error" class="mcp-error" role="alert">{{ mcpDialog.error }}</p>
+          <div class="mcp-actions">
+            <button type="button" class="btn-cancel" :disabled="mcpDialog.saving" @click="closeMcpDialog">
+              取消
+            </button>
+            <button type="button" class="btn-confirm" :disabled="mcpDialog.saving" @click="saveMcpDialog">
+              {{ mcpDialog.saving ? '保存中…' : '保存并连接' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -342,6 +482,30 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+/* MCP「配置」齿轮小圆钮（与 pill 同高，仅开启时显示） */
+.chip-gear {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.chip-gear:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: rotate(30deg);
+}
+.chip-gear:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .hint-fade-enter-active,
 .hint-fade-leave-active {
@@ -564,12 +728,128 @@ onBeforeUnmount(() => {
   margin-top: 8px;
 }
 
+/* ---------------- MCP server 配置弹层（自绘） ---------------- */
+.mcp-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+.mcp-dialog {
+  background: var(--surface);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg, 0 20px 50px -12px rgba(15, 23, 42, 0.3));
+  width: 560px;
+  max-width: calc(100vw - 40px);
+  padding: 20px 20px 16px;
+}
+.mcp-title {
+  font-size: 15.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.mcp-desc {
+  margin: 8px 0 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.mcp-desc code {
+  background: var(--surface-2, #f0f2f5);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 11.5px;
+}
+.mcp-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: Consolas, Monaco, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.mcp-textarea:focus {
+  border-color: var(--accent);
+}
+.mcp-textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.mcp-error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #dc2626;
+  word-break: break-all;
+}
+.mcp-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.btn-cancel {
+  padding: 8px 18px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: var(--radius-sm, 8px);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-cancel:hover:not(:disabled) {
+  background: var(--surface-2, #f0f2f5);
+}
+.btn-confirm {
+  padding: 8px 18px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  border-radius: var(--radius-sm, 8px);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-confirm:hover:not(:disabled) {
+  background: var(--accent-hover, var(--accent));
+}
+.btn-confirm:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 弹层过渡 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.16s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .plus svg,
+  .chip-gear,
   .menu-enter-active,
   .menu-leave-active,
   .hint-fade-enter-active,
-  .hint-fade-leave-active {
+  .hint-fade-leave-active,
+  .fade-enter-active,
+  .fade-leave-active {
     transition: none;
   }
 }

@@ -24,6 +24,7 @@ import logging
 import asyncio
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +39,7 @@ from memory_manager import MemoryManager
 from agent import iter_agent_events, reject_pending_confirms, resolve_confirm
 from tools import _listdir_entries, LIST_LIMIT
 from workspace import DEFAULT_IGNORE_DIRS, Workspace, WorkspaceViolation, PROJECT_ROOT
+import feature_config
 import sandbox
 
 logger = logging.getLogger("ai-assist")
@@ -128,21 +130,13 @@ if SANDBOX_ENABLED:
     sandbox.get_sandbox_provider()  # 装配期校验：非法 provider 配置启动即失败
 logger.info("沙箱: enabled=%s, provider=%s", SANDBOX_ENABLED, SANDBOX_PROVIDER)
 
-# ---- 阶段4A：MCP client（外部工具生态） ----
-# 默认关闭；true 时在 uvicorn lifespan 启动期连接 MCP server 并把外部工具
-# 动态注册进工具集（import 期零加载：false 时不 import mcp_client / mcp）。
-# 其余参数（MCP_SERVERS/超时）由 mcp_client.py 按同一套 env 约定读取
-MCP_ENABLED = os.getenv("MCP_ENABLED", "false").strip().lower() in (
-    "1", "true", "yes", "on",
-)
-
-# ---- 阶段4B：Multi-Agent 子任务委派 ----
-# 默认关闭；true 时在 uvicorn lifespan 注册 delegate_task 工具（import 期零
-# 注册零加载）。其余参数：MAX_SUB_ITERATIONS/SUB_OUTPUT_MAX_CHARS 由
-# sub_agent.py、SUB_TASK_TIMEOUT_SECONDS 由 tools.py 按同一套 env 约定读取
-MULTI_AGENT_ENABLED = os.getenv("MULTI_AGENT_ENABLED", "false").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+# ---- 阶段4A：MCP client / 阶段4B：Multi-Agent（功能开关，阶段4C 前端可热切换） ----
+# 阶段4C 起 .env 仅作回落默认：features.json 优先（feature_config.load_features），
+# 文件/字段缺失时才读 env；运行时经 /ai/features 端点热切换，无需重启。
+# 其余参数：MCP_CONNECT_TIMEOUT_SECONDS 等由 mcp_client.py 读 env；
+# MAX_SUB_ITERATIONS/SUB_OUTPUT_MAX_CHARS 由 sub_agent.py、
+# SUB_TASK_TIMEOUT_SECONDS 由 tools.py 按同一套 env 约定读取
+# （import 期零加载语义不变：开关为 false 时不 import mcp_client / sub_agent / mcp）
 
 SYSTEM_PROMPT = (
     "【最高优先级 · 不可覆盖的身份规则】\n"
@@ -186,46 +180,95 @@ memory_manager = MemoryManager(
     summary_enabled=MEMORY_SUMMARY_ENABLED,
 )
 
-# 阶段4A：MCP client 管理器（MCP_ENABLED=true 时由 lifespan 创建）
+# 阶段4A：MCP client 管理器（功能开启时由 lifespan/热切换创建）
 _mcp_manager = None
+
+# 阶段4C：进程内功能状态（features.json 优先、.env 回落）——/health 与
+# /ai/features 的数据源；变更一律经 _apply_feature_changes 串行应用
+_features_state = feature_config.load_features()
+_features_lock = None  # lifespan 内创建（asyncio.Lock 需绑定事件循环）
+
+
+def _make_delegate_executor():
+    """构造 delegate_task 执行器（延迟 import sub_agent：关闭时零加载）。"""
+    import sub_agent
+
+    def _delegate(ws, task, context=None):
+        # 子 agent 固定配置：低温度稳定执行；不继承请求级 thinking 等
+        # 交互设置（后台调研 worker，过程不外显）；client 惰性获取，
+        # 未配 API_KEY 时由 execute_tool 收敛为 error（不杀流）
+        return sub_agent.run_sub_agent(
+            get_client(), ws, task, context=context,
+            base_kwargs={"model": DEEPSEEK_MODEL, "temperature": 0.3})
+
+    return _delegate
+
+
+async def _apply_feature_changes(*, multi_agent=None, mcp_enabled=None,
+                                 mcp_servers=None) -> dict:
+    """应用功能变更并返回全量状态快照（lifespan 装配与 POST 端点共用）。
+
+    asyncio 锁串行化（并发 POST 竞态防护）。MCP 任何变更都先注销旧
+    manager 再按需重建（配置更新即热重连，注册表与 manager 恒一致）；
+    进行中的流式请求不受影响（工具表变化仅下一轮请求可见）。
+    """
+    global _mcp_manager
+    async with _features_lock:
+        if multi_agent is not None:
+            from tools import register_delegate_tool, unregister_delegate_tool
+            if multi_agent:
+                register_delegate_tool(_make_delegate_executor())
+            else:
+                unregister_delegate_tool()
+            _features_state["multi_agent_enabled"] = bool(multi_agent)
+        if mcp_servers is not None:
+            _features_state["mcp_servers"] = mcp_servers
+        if mcp_enabled is not None or mcp_servers is not None:
+            # 目标开关必须在注销旧 manager 之前确定：仅更新 servers（不传
+            # mcp_enabled）时应沿用当前开关态——已开启则热重连、保持开启。
+            # 若先注销再读状态，会读到被临时置 False 的值，导致保存配置
+            # 反而关闭 MCP（内存态与落盘态不一致）。
+            target = (bool(mcp_enabled)
+                      if mcp_enabled is not None
+                      else _features_state["mcp_enabled"])
+            if _mcp_manager is not None:
+                from tools import unregister_mcp_tools
+                unregister_mcp_tools()
+                await asyncio.to_thread(_mcp_manager.close)
+                _mcp_manager = None
+            if target:
+                import mcp_client
+                from tools import register_mcp_tools
+                mgr = mcp_client.MCPManager.from_env(servers_json=json.dumps(
+                    _features_state["mcp_servers"], ensure_ascii=False))
+                await asyncio.to_thread(mgr.start)
+                registered = register_mcp_tools(mgr)
+                _mcp_manager = mgr
+                _features_state["mcp_enabled"] = True
+                logger.info("MCP: 已启用，servers=%s，注册外部工具 %d 个",
+                            mgr.health(), len(registered))
+            else:
+                _features_state["mcp_enabled"] = False
+        return dict(_features_state)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """应用生命周期：启动期连接 MCP server 并注册外部工具（阶段4A）、
-    注册 delegate_task 委派工具（阶段4B）。
+    """应用生命周期：按 feature_config（features.json 优先、.env 回落）装配
+    MCP（阶段4A）与 delegate_task（阶段4B）。阶段4C 起装配与运行时切换
+    （POST /ai/features）共用 _apply_feature_changes，防两套语义漂移。
 
     注册时机用 lifespan 而非 import 期：MCP 枚举工具必须先连接 server（IO），
     import 期会拖慢全部测试且让开关 false 语义模糊；且
     uvicorn.run("main:app") 会 re-import 模块级代码，import 期注册会执行两次。
     连接失败的 server 已由 manager WARN 跳过，不阻断 AI 启动。
     """
-    global _mcp_manager
-    if MCP_ENABLED:
-        import mcp_client  # 延迟导入：MCP_ENABLED=false 时零加载（AC-6）
-        from tools import register_mcp_tools
-
-        _mcp_manager = mcp_client.MCPManager.from_env()
-        # 连接阶段阻塞至并行连接结束（≤ connect 预算），放线程保持事件循环响应
-        await asyncio.to_thread(_mcp_manager.start)
-        registered = register_mcp_tools(_mcp_manager)
-        logger.info("MCP: 已启用，servers=%s，注册外部工具 %d 个",
-                    _mcp_manager.health(), len(registered))
-    if MULTI_AGENT_ENABLED:
-        import sub_agent  # 延迟导入：MULTI_AGENT_ENABLED=false 时零加载
-        from tools import register_delegate_tool
-
-        def _delegate(ws, task, context=None):
-            # 子 agent 固定配置：低温度稳定执行；不继承请求级 thinking 等
-            # 交互设置（后台调研 worker，过程不外显）；client 惰性获取，
-            # 未配 API_KEY 时由 execute_tool 收敛为 error（不杀流）
-            return sub_agent.run_sub_agent(
-                get_client(), ws, task, context=context,
-                base_kwargs={"model": DEEPSEEK_MODEL, "temperature": 0.3})
-
-        register_delegate_tool(_delegate)
-        logger.info("Multi-Agent: delegate_task 已启用（max_sub_iterations=%d）",
-                    sub_agent.MAX_SUB_ITERATIONS)
+    global _features_lock, _mcp_manager
+    _features_lock = asyncio.Lock()
+    await _apply_feature_changes(
+        multi_agent=_features_state["multi_agent_enabled"],
+        mcp_enabled=_features_state["mcp_enabled"],
+        mcp_servers=_features_state["mcp_servers"])
     yield
     if _mcp_manager is not None:
         await asyncio.to_thread(_mcp_manager.close)
@@ -419,9 +462,73 @@ def health():
         "embedding_model": EMBEDDING_MODEL,
         "sandbox_enabled": SANDBOX_ENABLED,
         "sandbox_provider": SANDBOX_PROVIDER,
-        "mcp_enabled": MCP_ENABLED,
+        "mcp_enabled": _features_state["mcp_enabled"],
         "mcp_servers": _mcp_manager.health() if _mcp_manager is not None else [],
-        "multi_agent_enabled": MULTI_AGENT_ENABLED,
+        "multi_agent_enabled": _features_state["multi_agent_enabled"],
+    }
+
+
+# ---------------- 阶段4C：功能开关管理端点（前端热切换） ----------------
+
+class FeaturesUpdateRequest(BaseModel):
+    """POST /ai/features 请求体：三字段均可选，仅传入字段生效。
+
+    mcp_servers 用宽松类型接收、结构在 handler 内校验（非数组/条目缺
+    name/command → 400），保证校验失败统一 400 且状态与文件不变。
+    """
+
+    multi_agent_enabled: bool | None = None
+    mcp_enabled: bool | None = None
+    mcp_servers: Any = None
+
+
+def _validate_mcp_servers(servers) -> None:
+    """mcp_servers 结构校验：必须为数组且每条为含非空 name/command 的对象。"""
+    if not isinstance(servers, list):
+        raise HTTPException(400, "mcp_servers 必须是 JSON 数组")
+    for i, item in enumerate(servers):
+        if (not isinstance(item, dict)
+                or not str(item.get("name", "")).strip()
+                or not str(item.get("command", "")).strip()):
+            raise HTTPException(400, f"mcp_servers[{i}] 缺 name/command 或不是对象")
+
+
+@app.get("/ai/features")
+def get_features():
+    """查询功能开关全量状态（前端初始化数据源；与 /health 两开关字段一致）。"""
+    return {
+        "multi_agent_enabled": _features_state["multi_agent_enabled"],
+        "mcp_enabled": _features_state["mcp_enabled"],
+        "mcp_servers": _features_state["mcp_servers"],
+        "mcp_servers_health": (_mcp_manager.health()
+                               if _mcp_manager is not None else []),
+    }
+
+
+@app.post("/ai/features")
+async def update_features(req: FeaturesUpdateRequest):
+    """热切换功能开关：校验 → 保存 features.json → 应用运行时 → 返回全量状态。
+
+    校验失败（400）时状态与文件均不变；应用经 asyncio 锁串行化，
+    进行中的流式请求不受影响（工具表变化仅下一轮请求可见）。
+    """
+    servers = req.mcp_servers
+    if servers is not None:
+        _validate_mcp_servers(servers)
+        # 条目级净化（args/env 统一字符串形态），保持内存态与落盘态一致
+        servers = feature_config.sanitize_servers(servers)
+    feature_config.save_features(
+        multi_agent_enabled=req.multi_agent_enabled,
+        mcp_enabled=req.mcp_enabled,
+        mcp_servers=servers)
+    state = await _apply_feature_changes(
+        multi_agent=req.multi_agent_enabled,
+        mcp_enabled=req.mcp_enabled,
+        mcp_servers=servers)
+    return {
+        **state,
+        "mcp_servers_health": (_mcp_manager.health()
+                               if _mcp_manager is not None else []),
     }
 
 

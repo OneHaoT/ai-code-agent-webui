@@ -118,6 +118,26 @@ public class ChatController {
         return aiClient.health();
     }
 
+    // ---------------- 阶段4C：功能开关透传（MCP / Multi-Agent 前端热切换） ----------------
+
+    /**
+     * 功能开关全量状态（前端初始化数据源）。
+     * web 零业务逻辑，仅转发 GET /ai/features；ai 不可达 → 502（既有降级语义）。
+     */
+    @GetMapping("/ai/features")
+    public JsonNode aiFeatures() {
+        return aiClient.getFeatures();
+    }
+
+    /**
+     * 热切换功能开关：body 原样透传 POST /ai/features，应用后返回全量状态。
+     * ai 400（mcp_servers 结构非法）→ IllegalArgumentException 透传 400（含中文原因）。
+     */
+    @PostMapping("/ai/features")
+    public JsonNode updateAiFeatures(@RequestBody JsonNode body) {
+        return aiClient.updateFeatures(body);
+    }
+
     /** 把前端拖入的单个文件保存到 AI 默认工作区 */
     @PostMapping(value = "/workspace/files", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public JsonNode uploadWorkspaceFile(@RequestPart("file") MultipartFile file) throws IOException {

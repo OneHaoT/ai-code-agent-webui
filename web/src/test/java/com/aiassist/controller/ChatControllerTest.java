@@ -143,4 +143,50 @@ class ChatControllerTest {
         when(aiClient.openWorkspace("C:/code/sky-take-out")).thenReturn(boundResp);
         assertThat(controller.openWorkspace("C:/code/sky-take-out")).isSameAs(boundResp);
     }
+
+    // ---------------- 阶段4C：功能开关透传（GET/POST /ai/features） ----------------
+
+    @Test
+    void aiFeatures_forwardsToAiClient() {
+        JsonNode aiResp = new ObjectMapper().createObjectNode()
+                .put("multi_agent_enabled", false).put("mcp_enabled", false);
+        when(aiClient.getFeatures()).thenReturn(aiResp);
+
+        assertThat(controller.aiFeatures()).isSameAs(aiResp);
+    }
+
+    @Test
+    void updateAiFeatures_forwardsBodyAsIs() {
+        JsonNode body = new ObjectMapper().createObjectNode()
+                .put("mcp_enabled", true);   // body 原样透传，web 不理解字段语义
+        JsonNode aiResp = new ObjectMapper().createObjectNode()
+                .put("mcp_enabled", true);
+        when(aiClient.updateFeatures(body)).thenReturn(aiResp);
+
+        JsonNode out = controller.updateAiFeatures(body);
+        assertThat(out).isSameAs(aiResp);
+        org.mockito.Mockito.verify(aiClient).updateFeatures(body);
+    }
+
+    @Test
+    void updateAiFeatures_aiRejectedServers_propagatesBadRequest() {
+        // ai 侧 400（mcp_servers 结构非法）在 AiClient 内转为 IllegalArgumentException
+        when(aiClient.updateFeatures(org.mockito.ArgumentMatchers.any()))
+                .thenThrow(new IllegalArgumentException("mcp_servers[0] 缺 name/command 或不是对象"));
+
+        assertThatThrownBy(() -> controller.updateAiFeatures(
+                new ObjectMapper().createObjectNode()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("name/command");
+    }
+
+    @Test
+    void updateAiFeatures_aiDown_propagatesAiServiceException() {
+        when(aiClient.updateFeatures(org.mockito.ArgumentMatchers.any()))
+                .thenThrow(new AiServiceException("无法连接 AI 模块"));
+
+        assertThatThrownBy(() -> controller.updateAiFeatures(
+                new ObjectMapper().createObjectNode()))
+                .isInstanceOf(AiServiceException.class);
+    }
 }

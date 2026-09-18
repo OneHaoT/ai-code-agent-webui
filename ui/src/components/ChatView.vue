@@ -12,12 +12,14 @@ const props = defineProps({
   uploading: { type: Boolean, default: false },
   pendingThinking: { type: Boolean, default: false },
   aiStatus: { type: Object, default: () => ({}) },
+  // 阶段4C 功能开关全量状态（null = 未加载/AI 不可用，pills 禁用）
+  features: { type: Object, default: null },
   // 侧边栏折叠状态（控制 toggle 按钮图标）
   sidebarCollapsed: { type: Boolean, default: false },
   // 右侧工作区面板折叠状态
   workspaceCollapsed: { type: Boolean, default: false }
 })
-const emit = defineEmits(['send', 'stop', 'retry', 'confirm-decide', 'new', 'toggle-sidebar', 'toggle-workspace'])
+const emit = defineEmits(['send', 'stop', 'retry', 'confirm-decide', 'new', 'toggle-sidebar', 'toggle-workspace', 'toggle-feature', 'save-mcp-servers'])
 
 const toast = useToast()
 
@@ -207,8 +209,11 @@ watch(
     <ChatInput
       ref="chatInput"
       :sending="sending"
+      :features="features"
       @send="(t) => emit('send', t)"
       @stop="emit('stop')"
+      @toggle-feature="(k, v) => emit('toggle-feature', k, v)"
+      @save-mcp-servers="(p) => emit('save-mcp-servers', p)"
     />
 
     <!-- 拖拽图片进入聊天区时的全屏放置提示 -->

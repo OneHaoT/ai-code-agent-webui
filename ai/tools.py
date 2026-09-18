@@ -1182,6 +1182,44 @@ def register_delegate_tool(executor) -> None:
                 SUB_TASK_TIMEOUT_SECONDS)
 
 
+def unregister_delegate_tool() -> bool:
+    """注销 delegate_task（阶段4C 前端开关：Multi-Agent 关闭时调用）。
+
+    幂等：未注册时静默返回 False。四处一致清理：
+    TOOL_SCHEMAS / _DISPATCH / _TOOL_TIMEOUTS（_DELEGATE_SCHEMA 是模块级
+    常量无需清理，重注册时复用同一对象）。
+    """
+    existed = "delegate_task" in _DISPATCH
+    TOOL_SCHEMAS[:] = [s for s in TOOL_SCHEMAS
+                       if s["function"]["name"] != "delegate_task"]
+    _DISPATCH.pop("delegate_task", None)
+    _TOOL_TIMEOUTS.pop("delegate_task", None)
+    if existed:
+        logger.info("delegate_task 已注销")
+    return existed
+
+
+def unregister_mcp_tools() -> list[str]:
+    """注销全部外部 MCP 工具（阶段4C 前端开关：MCP 关闭/重连时调用）。
+
+    以 _MCP_TOOL_META 为源集，四处一致清理：TOOL_SCHEMAS（就地过滤）/
+    _DISPATCH / _TOOL_TIMEOUTS / _MCP_TOOL_META（清空）。幂等：无注册时
+    返回空列表。返回注销的工具名列表。
+    """
+    regs = list(_MCP_TOOL_META.keys())
+    if not regs:
+        return []
+    regset = set(regs)
+    TOOL_SCHEMAS[:] = [s for s in TOOL_SCHEMAS
+                       if s["function"]["name"] not in regset]
+    for r in regs:
+        _DISPATCH.pop(r, None)
+        _TOOL_TIMEOUTS.pop(r, None)
+    _MCP_TOOL_META.clear()
+    logger.info("MCP 工具已全部注销：%d 个", len(regs))
+    return regs
+
+
 def sub_toolset() -> tuple[list[dict], frozenset[str]]:
     """子 agent 工具集（请求期现场过滤）。
 

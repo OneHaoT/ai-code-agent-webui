@@ -248,5 +248,19 @@ export const api = {
     }
   },
 
-  aiStatus: () => request('/api/ai/status')
+  aiStatus: () => request('/api/ai/status'),
+
+  /**
+   * 功能开关全量状态（阶段4C：MCP / Multi-Agent 前端热切换）。
+   * 返回 {multi_agent_enabled, mcp_enabled, mcp_servers, mcp_servers_health}。
+   */
+  getFeatures: () => request('/api/ai/features'),
+
+  /**
+   * 热切换功能开关：body 三字段可选（multi_agent_enabled / mcp_enabled /
+   * mcp_servers），后端保存 features.json 并热应用后返回全量状态。
+   * mcp_servers 结构非法时后端 400（err.status === 400，err.message 为中文原因）。
+   */
+  updateFeatures: (body) =>
+    request('/api/ai/features', { method: 'POST', body: JSON.stringify(body) })
 }
